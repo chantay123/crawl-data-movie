@@ -4,14 +4,19 @@
  * Nhận vào một Source (OPhim / KKPhim / Nguonc...) và thực hiện:
  *   1. Lấy danh sách phim theo trang
  *   2. Lấy chi tiết từng phim (concurrency-controlled)
- *   3. Phân loại phim mới / phim cũ trong MongoDB
- *   4. Lưu phim mới + cập nhật tập mới cho phim cũ
+ *   3. Phân loại phim mới / phim cũ trong MongoDB (nếu useMongo=true)
+ *   4. Lưu phim mới + cập nhật tập mới cho phim cũ (nếu useMongo=true)
  *   5. Backup JSON (optional)
+ *
+ * STANDALONE MODE (useMongo=false):
+ *   - Không kết nối MongoDB
+ *   - Lưu toàn bộ data vào JSON files
+ *   - Hoàn toàn độc lập với backend
  */
 
 const pLimit = require('p-limit');
-const Movie = require('../models/Movie');
-const Category = require('../models/Category');
+const { Movie } = require('../models');
+const MovieService = require('./MovieService');
 const logger = require('../utils/logger');
 const jsonBackup = require('../utils/jsonBackup');
 
@@ -22,18 +27,35 @@ class CrawlerService {
     this.pageDelayMs = options.pageDelayMs || 500;
     this.useMongo = options.useMongo !== false;
     this.maxEmptyPages = options.maxEmptyPages ?? 2;
+    this.standaloneMode = options.standaloneMode || false; // Full JSON backup mode
   }
 
   async crawlPage(page = 1) {
     logger.info(`[${this.source.name()}] Crawling page ${page}...`);
     const items = await this.source.listMovies(page);
     if (items.length === 0) {
-      return { savedMovies: [], updatedMovies: [], itemsFound: 0 };
+      return { savedMovies: [], updatedMovies: [], itemsFound: 0, moviesData: [] };
     }
 
-    const existingMap = await this._loadExistingMap(items);
+    // Fetch all details first
     const detailMap = await this._fetchDetails(items);
 
+    // Standalone mode: return full data without MongoDB
+    if (this.standaloneMode || !this.useMongo) {
+      const moviesData = Array.from(detailMap.values());
+      logger.info(
+        `[${this.source.name()}] Page ${page}: ${moviesData.length} movies fetched (standalone mode)`
+      );
+      return { 
+        savedMovies: [], 
+        updatedMovies: [], 
+        itemsFound: items.length,
+        moviesData 
+      };
+    }
+
+    // MongoDB mode: save to database
+    const existingMap = await this._loadExistingMap(items);
     const { newItems, existingItems } = this._partition(detailMap, existingMap);
 
     const savedMovies = await this._saveNewMovies(newItems);
@@ -42,19 +64,31 @@ class CrawlerService {
     logger.info(
       `[${this.source.name()}] Page ${page}: +${savedMovies.length} new, ~${updatedMovies.length} updated`
     );
-    return { savedMovies, updatedMovies, itemsFound: items.length };
+    return { savedMovies, updatedMovies, itemsFound: items.length, moviesData: [] };
   }
 
   async crawlAllPages(totalPages, onPage = null) {
-    const result = { savedMovies: [], updatedMovies: [], errors: [], lastPage: 0 };
+    const result = { 
+      savedMovies: [], 
+      updatedMovies: [], 
+      errors: [], 
+      lastPage: 0,
+      moviesData: [] // Full data for standalone mode
+    };
     let emptyStreak = 0;
 
     for (let page = 1; page <= totalPages; page++) {
       try {
-        const { savedMovies, updatedMovies, itemsFound } = await this.crawlPage(page);
+        const { savedMovies, updatedMovies, itemsFound, moviesData } = await this.crawlPage(page);
         result.savedMovies.push(...savedMovies);
         result.updatedMovies.push(...updatedMovies);
         result.lastPage = page;
+        
+        // Collect full data in standalone mode
+        if (moviesData && moviesData.length > 0) {
+          result.moviesData.push(...moviesData);
+        }
+        
         if (typeof onPage === 'function') onPage(page);
 
         if (!itemsFound) {
@@ -75,8 +109,22 @@ class CrawlerService {
       await this._sleep(this.pageDelayMs);
     }
 
+    // Save results to JSON
     if (jsonBackup) {
-      jsonBackup.save(this.source.name(), result);
+      if (this.standaloneMode && result.moviesData.length > 0) {
+        // Save full data in standalone mode
+        jsonBackup.saveFullData(this.source.name(), result.moviesData);
+      } else {
+        // Save summary in MongoDB mode
+        jsonBackup.save(this.source.name(), {
+          savedMovies: result.savedMovies,
+          updatedMovies: result.updatedMovies,
+          errors: result.errors,
+          lastPage: result.lastPage,
+          totalSaved: result.savedMovies.length,
+          totalUpdated: result.updatedMovies.length
+        });
+      }
     }
     return result;
   }
@@ -132,21 +180,11 @@ class CrawlerService {
     const saved = [];
     for (const { normalized } of newItems) {
       try {
-        const categoryName =
-          normalized.category?.[0]?.name || normalized.genre || 'Unknown';
-        await Category.findOneAndUpdate(
-          { name: categoryName },
-          { name: categoryName },
-          { upsert: true, new: true }
-        );
-
-        await Movie.findOneAndUpdate(
-          { slug: normalized.slug },
-          { ...normalized, _source: this.source.name(), _crawledAt: new Date() },
-          { upsert: true, new: true, setDefaultsOnInsert: true }
-        );
+        const result = await MovieService.saveMovie(normalized, this.source.name());
         saved.push(normalized.slug);
-        logger.info(`Saved: ${normalized.name} (${normalized.slug})`);
+        logger.info(
+          `${result.isNew ? 'Created' : 'Updated'}: ${normalized.name} (${normalized.slug})`
+        );
       } catch (err) {
         logger.error(`Save failed [${normalized.slug}]: ${err.message}`);
       }
@@ -158,69 +196,44 @@ class CrawlerService {
     if (!this.useMongo || existingItems.length === 0) return [];
     const updated = [];
     for (const { slug, normalized, existing } of existingItems) {
-      const result = await this._mergeEpisodes(existing, normalized.episodes || []);
-      if (result.changed) {
-        try {
-          await Movie.findOneAndUpdate(
-            { slug },
-            {
-              episodes: result.episodes,
-              episode_current: result.episode_current,
-              episode_total: result.episode_total,
-              modified: { time: new Date() },
-              _crawledAt: new Date(),
-            }
+      try {
+        // Sử dụng MovieService để update với đầy đủ relationships
+        const result = await MovieService.saveMovie(normalized, this.source.name());
+        
+        // Merge episodes nếu có episodes mới
+        if (normalized.episodes && normalized.episodes.length > 0) {
+          const mergeResult = await MovieService.updateEpisodes(
+            result.movie._id, 
+            normalized.episodes
           );
-          updated.push(slug);
-          logger.info(`Updated episodes: ${normalized.name} (+${result.added})`);
-        } catch (err) {
-          logger.error(`Update failed [${slug}]: ${err.message}`);
+          if (mergeResult.changed) {
+            updated.push(slug);
+            logger.info(`Updated episodes: ${normalized.name} (+${mergeResult.added} episodes)`);
+          }
         }
+      } catch (err) {
+        logger.error(`Update failed [${slug}]: ${err.message}`);
       }
     }
     return updated;
   }
 
-  _mergeEpisodes(existing, newEpisodes) {
-    const result = {
-      changed: false,
-      added: 0,
-      episodes: [...(existing.episodes || [])],
-      episode_current: existing.episode_current,
-      episode_total: existing.episode_total,
-    };
-
-    for (const newServer of newEpisodes) {
-      const idx = result.episodes.findIndex((s) => s.server_name === newServer.server_name);
-      if (idx === -1) {
-        result.episodes.push(newServer);
-        result.added += newServer.server_data?.length || 0;
-        result.changed = true;
-      } else {
-        const exist = result.episodes[idx];
-        const existSlugs = new Set(exist.server_data.map((e) => e.slug));
-        const toAdd = (newServer.server_data || []).filter((e) => !existSlugs.has(e.slug));
-        if (toAdd.length > 0) {
-          exist.server_data = [...exist.server_data, ...toAdd];
-          result.added += toAdd.length;
-          result.changed = true;
-        }
-      }
-    }
-
-    if (result.changed) {
-      let max = 0;
-      for (const s of result.episodes) {
-        if (s.server_data?.length > max) max = s.server_data.length;
-      }
-      result.episode_current = `Đã cập nhật ${max} tập`;
-      result.episode_total = `${max} Tập`;
-    }
-    return result;
-  }
+  // _mergeEpisodes đã được move sang MovieService
 
   _sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  _generateSlug(text) {
+    if (!text) return 'unknown';
+    return text
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .substring(0, 200);
   }
 }
 

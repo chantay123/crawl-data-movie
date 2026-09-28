@@ -20,7 +20,7 @@ const swaggerUi = require('swagger-ui-express');
 const config = require('./config');
 const db = require('./utils/db');
 const logger = require('./utils/logger');
-const Movie = require('./models/Movie');
+const { Movie } = require('./models');
 const CrawlerService = require('./services/CrawlerService');
 const { getEnabledSources, getSource } = require('./services/SourceRegistry');
 const openapiSpec = require('./openapi');
@@ -150,6 +150,16 @@ app.get('/movies/:slug', async (req, res, next) => {
   try {
     const movie = await Movie.findOne({ slug: req.params.slug }).lean();
     if (!movie) return res.status(404).json({ error: 'Movie not found', slug: req.params.slug });
+
+    // Get trailer if not cached (key missing)
+    if (movie.tmdb?.id && !movie.trailer?.key) {
+      const TrailerService = require('./services/TrailerService');
+      const result = await TrailerService.getTrailer(movie);
+      if (result && result.status === 'FOUND') {
+        movie.trailer = result.trailer;
+      }
+    }
+
     res.json(movie);
   } catch (err) {
     next(err);
@@ -217,6 +227,64 @@ app.get('/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(job);
+});
+
+// --- Trailer Management ----------------------------------------
+app.post('/movies/:slug/trailer/fetch', async (req, res, next) => {
+  try {
+    const TrailerService = require('./services/TrailerService');
+    const result = await TrailerService.fetchAndUpdateTrailer(req.params.slug);
+
+    if (!result.success) {
+      return res.status(404).json({
+        success: false,
+        message: result.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: result.message,
+      trailer: result.trailer,
+      status: result.status
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/trailers/batch-update', async (req, res, next) => {
+  try {
+    const limit = parseInt(req.body.limit) || 50;
+    const TrailerService = require('./services/TrailerService');
+
+    res.status(202).json({
+      message: `Batch update started for ${limit} movies`,
+      status: 'processing'
+    });
+
+    // Run in background
+    TrailerService.batchUpdateTrailers(limit)
+      .then(stats => {
+        logger.info(`[API] Batch trailer update completed: ${JSON.stringify(stats)}`);
+      })
+      .catch(err => {
+        logger.error(`[API] Batch trailer update failed: ${err.message}`);
+      });
+
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Rate limiter diagnostics -----------------------------------
+app.get('/youtube/status', (_req, res) => {
+  try {
+    const rateLimiter = require('./utils/youtubeRateLimiter');
+    res.json(rateLimiter.status());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --- Swagger UI ------------------------------------------------
@@ -292,15 +360,61 @@ const PORT = process.env.API_PORT || 3000;
 async function start() {
   if (process.env.SKIP_DB !== 'true') {
     try {
+      logger.info('⏳ Connecting to MongoDB...');
+      
+      // STEP 1: Connect and wait for FULLY READY state
       await db.connect();
+      
+      // STEP 2: Verify readyState === 1 (connected)
+      if (mongoose.connection.readyState !== 1) {
+        throw new Error(`MongoDB not ready. ReadyState: ${mongoose.connection.readyState} (expected: 1)`);
+      }
+      logger.info('✅ MongoDB readyState verified (1=connected)');
+      
+      // STEP 3: Load local models (migrated from backend)
+      try {
+        const models = require('./models');
+        logger.info('✅ Local models loaded successfully');
+        logger.info(`   Total models registered: ${Object.keys(mongoose.models).length}`);
+      } catch (err) {
+        throw new Error(`Local models loading failed: ${err.message}`);
+      }
+      
+      // STEP 4: Test query để verify models hoạt động
+      try {
+        const Category = mongoose.model('Category');
+        const testCount = await Category.countDocuments();
+        logger.info(`✅ Test query successful (${testCount} categories in database)`);
+      } catch (err) {
+        throw new Error(`Test query failed: ${err.message}`);
+      }
+      
     } catch (err) {
-      logger.warn(`MongoDB unavailable: ${err.message}. API will start but DB endpoints will fail.`);
+      logger.error(`❌ Startup failed: ${err.message}`);
+      logger.error(`   MongoDB URI: ${process.env.MONGODB_URI}/${process.env.MONGODB_NAME}`);
+      logger.error(`   ReadyState: ${mongoose.connection.readyState}`);
+      logger.error('');
+      logger.error('🔧 Troubleshooting:');
+      logger.error('   1. Check if MongoDB is running: mongosh');
+      logger.error('   2. Check MONGODB_URI in .env file');
+      logger.error('   3. Check network/firewall settings');
+      logger.error('');
+      logger.error('Server cannot start without database connection');
+      process.exit(1);
     }
   }
+  
   app.listen(PORT, () => {
-    logger.info(`🚀 Crawler API listening on http://localhost:${PORT}`);
-    logger.info(`📚 Swagger UI:  http://localhost:${PORT}/docs`);
-    logger.info(`📄 OpenAPI JSON: http://localhost:${PORT}/openapi.json`);
+    logger.info('');
+    logger.info('='.repeat(60));
+    logger.info(`🚀 Crawler API Server Started`);
+    logger.info('='.repeat(60));
+    logger.info(`   Server:      http://localhost:${PORT}`);
+    logger.info(`   Swagger UI:  http://localhost:${PORT}/docs`);
+    logger.info(`   OpenAPI:     http://localhost:${PORT}/openapi.json`);
+    logger.info(`   Health:      http://localhost:${PORT}/health`);
+    logger.info('='.repeat(60));
+    logger.info('');
   });
 }
 

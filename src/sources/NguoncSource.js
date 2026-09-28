@@ -80,18 +80,29 @@ class NguoncSource extends BaseSource {
     return out;
   }
 
-  // Lấy categories kèm gán group để tách quốc gia
+  // Lấy categories kèm gán group để tách quốc gia và năm
   _splitCategories(categories) {
     const category = [];
     const country = [];
+    const years = [];
+    const formats = [];
+    
     for (const c of categories) {
-      if (c.group === 'quốc gia') {
+      const groupLower = (c.group || '').toLowerCase();
+      
+      if (groupLower.includes('quốc gia') || groupLower === 'country') {
         country.push(c);
+      } else if (groupLower.includes('năm') || groupLower === 'year') {
+        years.push(c);
+      } else if (groupLower.includes('định dạng') || groupLower === 'format' || groupLower === 'quality') {
+        formats.push(c);
       } else {
+        // Chỉ thể loại thực sự (Action, Drama...) mới vào category
         category.push(c);
       }
     }
-    return { category, country };
+    
+    return { category, country, years, formats };
   }
 
   // Helper: split CSV "casts" thành mảng
@@ -110,10 +121,32 @@ class NguoncSource extends BaseSource {
     const movieInfo = raw;
 
     const allCats = this._flattenCategories(movieInfo.category);
-    const { category, country } = this._splitCategories(allCats);
+    const { category, country, years, formats } = this._splitCategories(allCats);
+
+    // Extract year from years array or use movieInfo.year as fallback
+    let finalYear = parseInt(movieInfo.year, 10) || new Date().getFullYear();
+    if (years.length > 0) {
+      const yearFromCategory = parseInt(years[0].name, 10);
+      if (!isNaN(yearFromCategory) && yearFromCategory >= 1900 && yearFromCategory <= 2100) {
+        finalYear = yearFromCategory;
+      }
+    }
+
+    // Extract quality from formats array or use movieInfo.quality as fallback
+    let finalQuality = movieInfo.quality || 'HD';
+    if (formats.length > 0 && formats[0].name) {
+      finalQuality = formats[0].name;
+    }
 
     return {
-      tmdb: { type: null, id: '', season: null, vote_average: 0, vote_count: 0 },
+      tmdb: { 
+        type: null, 
+        id: '', 
+        season: null, 
+        vote_average: 0, 
+        vote_count: 0,
+        trailer_url: movieInfo.trailer_url || ''
+      },
       imdb: { id: '' },
       created: { time: movieInfo.created ? new Date(movieInfo.created) : new Date() },
       modified: { time: movieInfo.modified ? new Date(movieInfo.modified) : new Date() },
@@ -128,16 +161,18 @@ class NguoncSource extends BaseSource {
             : 'ongoing')
         : 'completed',
       thumb_url: movieInfo.thumb_url || '',
+      poster_url: movieInfo.poster_url || '',
+      backdrop_url: movieInfo.backdrop_url || '',
       trailer_url: movieInfo.trailer_url || '',
       time: movieInfo.time || '60 phút/tập',
       episode_current: movieInfo.current_episode || '',
       episode_total: movieInfo.total_episodes ? String(movieInfo.total_episodes) : '',
-      quality: movieInfo.quality || 'HD',
+      quality: finalQuality,
       lang: movieInfo.language || 'Vietsub',
       notify: '',
       showtimes: '',
       slug: movieInfo.slug,
-      year: parseInt(movieInfo.year, 10) || new Date().getFullYear(),
+      year: finalYear,
       view: movieInfo.view || 0,
       actor: this._splitCasts(movieInfo.casts),
       director: movieInfo.director ? movieInfo.director.split(/,\s*/).filter(Boolean) : [''],
@@ -145,7 +180,6 @@ class NguoncSource extends BaseSource {
       country,
       is_copyright: false,
       chieurap: false,
-      poster_url: movieInfo.poster_url || '',
       sub_docquyen: false,
       // nguonc dùng "items" trong episodes (không phải server_data) và "embed" (không phải link_embed/link_m3u8)
       episodes: Array.isArray(movieInfo.episodes)

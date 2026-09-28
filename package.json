@@ -12,8 +12,21 @@
     "crawl:kkphim": "node scripts/crawl-kkphim.js",
     "crawl:nguonc": "node scripts/crawl-nguonc.js",
     "crawl:all": "node scripts/crawl-all.js",
+    "crawl:standalone": "node scripts/crawl-standalone.js",
     "export:json": "node scripts/export-json.js",
-    "test:endpoints": "node scripts/test-endpoints.js"
+    "test:endpoints": "node scripts/test-endpoints.js",
+    "test:db": "node scripts/test-database-connection.js",
+    "test:connection": "node scripts/test-connection-quick.js",
+    "test:tmdb": "node scripts/test-tmdb.js",
+    "test:tmdb-quick": "node scripts/test-tmdb-quick.js",
+    "test:tmdb-fixed": "node scripts/test-tmdb-fixed.js",
+    "test:enrichment": "node scripts/test-enrichment.js",
+    "test:trailer": "node scripts/test-trailer-system.js",
+    "test:trailer-quick": "node scripts/test-trailer-quick.js",
+    "trailer:batch": "node scripts/batch-update-trailers.js",
+    "migrate": "node scripts/migrate-to-normalized-schema.js",
+    "cleanup:years": "node scripts/cleanup-years-in-categories.js",
+    "quick-start": "node scripts/quick-start.js"
   },
   "keywords": [
     "crawler",

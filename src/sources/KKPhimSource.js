@@ -49,7 +49,14 @@ class OPhimNormalizer {
     const { movie: movieInfo, episodes } = raw;
     if (!movieInfo) return null;
     return {
-      tmdb: movieInfo.tmdb || {},
+      tmdb: {
+        type: movieInfo.tmdb?.type || null,
+        id: movieInfo.tmdb?.id || '',
+        season: movieInfo.tmdb?.season || null,
+        vote_average: movieInfo.tmdb?.vote_average || 0,
+        vote_count: movieInfo.tmdb?.vote_count || 0,
+        trailer_url: movieInfo.trailer_url || '',
+      },
       imdb: movieInfo.imdb || { id: '' },
       created: { time: movieInfo.created?.time || new Date() },
       modified: { time: movieInfo.modified?.time || new Date() },
@@ -59,6 +66,8 @@ class OPhimNormalizer {
       type: movieInfo.type || 'series',
       status: movieInfo.status || 'completed',
       thumb_url: movieInfo.thumb_url || '',
+      poster_url: movieInfo.poster_url || '',
+      backdrop_url: movieInfo.backdrop_url || '',
       trailer_url: movieInfo.trailer_url || '',
       time: movieInfo.time || '60 phút/tập',
       episode_current: movieInfo.episode_current || '',
@@ -74,7 +83,6 @@ class OPhimNormalizer {
       country: movieInfo.country || [],
       is_copyright: movieInfo.is_copyright || false,
       chieurap: movieInfo.chieurap || false,
-      poster_url: movieInfo.poster_url || '',
       sub_docquyen: movieInfo.sub_docquyen || false,
       episodes: episodes || [],
     };
