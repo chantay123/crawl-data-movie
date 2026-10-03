@@ -63,7 +63,7 @@ const actorSchema = new Schema({
   // ============================================================
   source: {
     type: String,
-    enum: ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'import'],
+    enum: ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'wikipedia', 'wikidata', 'import'],
     default: 'manual'
   },
   externalId: {

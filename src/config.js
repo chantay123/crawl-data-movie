@@ -79,4 +79,31 @@ module.exports = {
     requestDelay: toInt(process.env.WIKIPEDIA_REQUEST_DELAY, 300),
     fallbackToWikiOnTMDBFail: toBool(process.env.WIKIPEDIA_FALLBACK_ON_TMDB_FAIL, true),
   },
+
+  // Wikidata API configuration (không cần API key)
+  wikidata: {
+    enabled: toBool(process.env.ENABLE_WIKIDATA_ENRICHMENT, true),
+    // KHÔNG hard-code trong source — đọc từ env WIKIDATA_API_URL
+    apiUrl: process.env.WIKIDATA_API_URL || 'https://www.wikidata.org/w/api.php',
+    // Wikidata anon rate limit ≈ 1 req/s. Default 1100ms (an toàn + chừa margin).
+    // Nếu bạn có bot account / User-Agent đã đăng ký, có thể giảm xuống 250-500.
+    requestDelay: toInt(process.env.WIKIDATA_REQUEST_DELAY, 1100),
+    timeoutMs: toInt(process.env.WIKIDATA_TIMEOUT_MS, 10000),
+    maxRetries: toInt(process.env.WIKIDATA_MAX_RETRIES, 4),
+    lang: process.env.WIKIDATA_LANG || 'en',
+    userAgent: process.env.WIKIDATA_USER_AGENT || 'MovieStreaming/1.0 (https://github.com/your-repo; contact: your-email@example.com)',
+    // Cache config — KHÔNG cache transient errors (RATE_LIMITED / SERVER_ERROR / NETWORK_ERROR)
+    cacheEnabled: toBool(process.env.WIKIDATA_CACHE_ENABLED, true),
+    cacheTtlMs: toInt(process.env.WIKIDATA_CACHE_TTL_MS, 24 * 60 * 60 * 1000),
+    cacheMaxEntries: toInt(process.env.WIKIDATA_CACHE_MAX_ENTRIES, 5000),
+    // Pause config — khi gặp 429, queue pause tối thiểu minPauseMs (an toàn ~60s).
+    // Mỗi lần gặp 429 tiếp theo trong cùng "burst", pause sẽ tăng theo cấp số nhân
+    // (escalate) cho tới khi hết cơn rate-limit.
+    minPauseMs: toInt(process.env.WIKIDATA_MIN_PAUSE_MS, 60000),
+    maxPauseMs: toInt(process.env.WIKIDATA_MAX_PAUSE_MS, 10 * 60 * 1000),
+    // Retry delays (ms) cho 429 / 5xx / network. Mặc định 30s → 60s → 120s → 240s.
+    retryDelays: (process.env.WIKIDATA_RETRY_DELAYS || '30000,60000,120000,240000')
+      .split(',').map(s => parseInt(s.trim(), 10)).filter(Number.isFinite),
+    concurrency: toInt(process.env.WIKIDATA_CONCURRENCY, 1),
+  },
 };

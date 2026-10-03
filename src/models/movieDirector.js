@@ -38,7 +38,7 @@ const movieDirectorSchema = new Schema({
   },
   source: {
     type: String,
-    enum: ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'import'],
+    enum: ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'wikipedia', 'wikidata', 'import'],
     default: 'manual'
   }
 }, {
@@ -59,17 +59,28 @@ movieDirectorSchema.index({ movieId: 1, order: 1 });
 
 // Add director to movie
 movieDirectorSchema.statics.addDirector = async function(movieId, directorId, options = {}) {
-  const existing = await this.findOne({ movieId, directorId });
-  if (existing) return existing;
-  
-  return await this.create({
-    movieId,
-    directorId,
-    role: options.role || 'director',
-    order: options.order || 0,
-    isMain: options.isMain !== undefined ? options.isMain : true,
-    source: options.source || 'manual'
-  });
+  try {
+    const existing = await this.findOne({ movieId, directorId });
+    if (existing) return existing;
+
+    // Sanitize source — chỉ cho phép các giá trị trong enum
+    const ALLOWED_SOURCES = ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'wikipedia', 'wikidata', 'import'];
+    const rawSource = options.source || 'manual';
+    const source = ALLOWED_SOURCES.includes(rawSource) ? rawSource : 'manual';
+
+    return await this.create({
+      movieId,
+      directorId,
+      role: options.role || 'director',
+      order: options.order || 0,
+      isMain: options.isMain !== undefined ? options.isMain : true,
+      source,
+    });
+  } catch (err) {
+    // KHÔNG throw — caller sẽ log warning và tiếp tục pipeline
+    console.warn(`[MovieDirector.addDirector] failed for movieId=${movieId} directorId=${directorId}: ${err.message}`);
+    return null;
+  }
 };
 
 // Remove director from movie
@@ -100,25 +111,62 @@ movieDirectorSchema.statics.getDirectorMovies = async function(directorId, optio
 };
 
 // Set directors for a movie (replace all)
+// directors = [{ directorId, role, order, isMain, source }]
+//
+// QUY TẮC (theo yêu cầu):
+//   - Một director lỗi KHÔNG được fail toàn bộ quá trình save
+//   - Sanitize `source` trước khi insert (loại bỏ giá trị không hợp lệ)
+//   - Dùng ordered:false để 1 row lỗi không rollback các row khác
 movieDirectorSchema.statics.setDirectors = async function(movieId, directors) {
-  // directors = [{ directorId, role, order, isMain }]
-  
   // Remove all existing
-  await this.deleteMany({ movieId });
-  
-  // Add new ones
+  try {
+    await this.deleteMany({ movieId });
+  } catch (err) {
+    console.warn(`[MovieDirector.setDirectors] deleteMany failed for movieId=${movieId}: ${err.message}`);
+    // Tiếp tục — không throw
+  }
+
   if (!directors || directors.length === 0) return [];
-  
-  const docs = directors.map((director, index) => ({
-    movieId,
-    directorId: director.directorId,
-    role: director.role || 'director',
-    order: director.order !== undefined ? director.order : index,
-    isMain: director.isMain !== undefined ? director.isMain : true,
-    source: director.source || 'manual'
-  }));
-  
-  return await this.insertMany(docs);
+
+  const ALLOWED_SOURCES = ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'wikipedia', 'wikidata', 'import'];
+  const ALLOWED_ROLES = ['director', 'co-director', 'assistant-director', 'other'];
+
+  // Lọc + sanitize TỪNG record. Nếu record không hợp lệ → bỏ qua, log warning.
+  const docs = [];
+  for (let index = 0; index < directors.length; index++) {
+    const director = directors[index] || {};
+    if (!director.directorId) {
+      console.warn(`[MovieDirector.setDirectors] skip record[${index}]: missing directorId`);
+      continue;
+    }
+    const rawSource = director.source || 'manual';
+    const source = ALLOWED_SOURCES.includes(rawSource) ? rawSource : 'manual';
+    const rawRole = director.role || 'director';
+    const role = ALLOWED_ROLES.includes(rawRole) ? rawRole : 'director';
+
+    docs.push({
+      movieId,
+      directorId: director.directorId,
+      role,
+      order: typeof director.order === 'number' ? director.order : index,
+      isMain: director.isMain !== undefined ? !!director.isMain : true,
+      source,
+    });
+  }
+
+  if (docs.length === 0) return [];
+
+  try {
+    // ordered:false → nếu 1 row fail validation, các row khác vẫn insert thành công
+    return await this.insertMany(docs, { ordered: false });
+  } catch (err) {
+    if (err && err.insertedDocs && Array.isArray(err.insertedDocs)) {
+      console.warn(`[MovieDirector.setDirectors] partial insert for movieId=${movieId}: ${err.message}`);
+      return err.insertedDocs;
+    }
+    console.warn(`[MovieDirector.setDirectors] insertMany failed for movieId=${movieId}: ${err.message}`);
+    return [];
+  }
 };
 
 // Count movies for a director

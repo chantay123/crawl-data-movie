@@ -153,18 +153,25 @@ class YouTubeRateLimiter {
   /**
    * Failure → maybe trip circuit breaker, maybe set global cooldown.
    * Returns retry decision for THIS attempt's caller.
+   *
+   * @param {Object} [info]
+   * @param {number} [info.status]
+   * @param {number|null} [info.retryAfterMs]
+   * @param {boolean} [info.network]
+   * @param {boolean} [info.quotaExceeded] quota hết → cooldown tới 00:00 PT
    */
-  recordFailure({ status, retryAfterMs = null, network = false } = {}) {
-    // If we received Retry-After, honour it as a global cooldown.
-    // Cap at maxDelayMs so we don't sit idle for a day.
-    if (status === 429 && retryAfterMs && retryAfterMs > 0) {
+  recordFailure({ status, retryAfterMs = null, network = false, quotaExceeded = false } = {}) {
+    // If we received Retry-After (or hit quota), honour it as a global cooldown.
+    // Cap at maxDelayMs so we don't sit idle beyond the daily reset.
+    if ((status === 429 || quotaExceeded) && retryAfterMs && retryAfterMs > 0) {
       const capped = Math.min(retryAfterMs, this.maxDelayMs);
       this.globalCooldownUntil = Date.now() + capped;
       const cappedNote = capped < retryAfterMs
         ? ` (capped from ${Math.round(retryAfterMs / 1000)}s)`
         : '';
-      this.globalCooldownReason =
-        `Retry-After header (${Math.round(capped / 1000)}s)${cappedNote}`;
+      this.globalCooldownReason = quotaExceeded
+        ? `QUOTA_EXCEEDED → next reset ${new Date(this.globalCooldownUntil).toISOString()}${cappedNote}`
+        : `Retry-After header (${Math.round(capped / 1000)}s)${cappedNote}`;
       logger.warn(`[YT-Limiter] ⏸  Global cooldown set: ${this.globalCooldownReason}`);
     }
 
@@ -215,6 +222,39 @@ class YouTubeRateLimiter {
     return this.cb.state === STATES.OPEN;
   }
 
+  /**
+   * ⭐ Còn bao lâu nữa thì sẵn sàng gọi lại? (ms). 0 = sẵn sàng ngay.
+   *
+   * Yêu cầu #9: circuit breaker KHÔNG được khóa hệ thống trailer quá lâu.
+   * - Circuit OPEN  → còn `cooldownMs - elapsed` (mặc định 5 phút, xem module exports)
+   * - Global cooldown (429 / hết quota) → còn `globalCooldownUntil - now`
+   * Lấy MAX của hai, vì cả hai đều chặn request.
+   *
+   * Circuit tự đóng khi hết cooldown (chuyển HALF_OPEN ở lần _readyIn() kế tiếp).
+   *
+   * @returns {number} milliseconds
+   */
+  readyInMs() {
+    return Math.max(0, this._readyIn());
+  }
+
+  /** true nếu có thể gọi YouTube ngay (không circuit OPEN, không cooldown). */
+  isReady() {
+    return this._readyIn() <= 0;
+  }
+
+  /**
+   * Retry-after dùng cho persist `trailerRetryAt` trong DB.
+   * Ưu tiên global cooldown (thường dài hơn vì bám quota reset), fallback circuit cooldown.
+   * @returns {number} ms
+   */
+  retryAfterMs() {
+    const globalWait = this.globalCooldownUntil > 0
+      ? this.globalCooldownUntil - Date.now()
+      : 0;
+    return Math.max(globalWait, this.readyInMs(), 1000);
+  }
+
   /** For diagnostics / status endpoint. */
   status() {
     return {
@@ -222,6 +262,9 @@ class YouTubeRateLimiter {
       active: this.maxConcurrent,
       cbState: this.cb.state,
       cbFailureCount: this.cb.failureCount,
+      cbCooldownMs: this.cb.cooldownMs,
+      readyInMs: this.readyInMs(),
+      isReady: this.isReady(),
       globalCooldownUntil: this.globalCooldownUntil > 0
         ? new Date(this.globalCooldownUntil).toISOString()
         : null,
@@ -241,11 +284,16 @@ class YouTubeRateLimiter {
 
 module.exports = new YouTubeRateLimiter({
   concurrency: parseInt(process.env.YOUTUBE_CONCURRENCY || '1', 10),
-  maxRetries: parseInt(process.env.YOUTUBE_MAX_RETRIES || '3', 10),
-  baseDelayMs: parseInt(process.env.YOUTUBE_RETRY_BASE_DELAY_MS || '30000', 10),
-  maxDelayMs: parseInt(process.env.YOUTUBE_RETRY_MAX_DELAY_MS || '3600000', 10),
-  cbFailureThreshold: parseInt(process.env.YOUTUBE_CIRCUIT_FAILURE_THRESHOLD || '3', 10),
-  cbCooldownMs: parseInt(process.env.YOUTUBE_CIRCUIT_COOLDOWN_MS || '900000', 10),
-  minIntervalMs: parseInt(process.env.YOUTUBE_REQUEST_DELAY || '5000', 10)
+  // Chỉ retry cho timeout/5xx. 429 + QUOTA_EXCEEDED đã bị chặn retry ở tầng trên.
+  maxRetries: parseInt(process.env.YOUTUBE_MAX_RETRIES || '2', 10),
+  baseDelayMs: parseInt(process.env.YOUTUBE_RETRY_BASE_DELAY_MS || '5000', 10),
+  maxDelayMs: parseInt(process.env.YOUTUBE_RETRY_MAX_DELAY_MS || '120000', 10),
+  // Ngưỡng mở circuit: 2 lỗi liên tiếp là đủ (quota 10k/ngày, retry vô ích chỉ tốn thêm).
+  cbFailureThreshold: parseInt(process.env.YOUTUBE_CIRCUIT_FAILURE_THRESHOLD || '2', 10),
+  // ⭐ Yêu cầu #9: cooldown HỢP LÝ, không khóa trailer lâu.
+  // 5 phút thay vì 15 — sau đó HALF_OPEN cho phép thử lại ngay.
+  // (Hết quota thật sự sẽ có globalCooldown riêng kéo tới 00:00 PT, tự động dài hơn.)
+  cbCooldownMs: parseInt(process.env.YOUTUBE_CIRCUIT_COOLDOWN_MS || '300000', 10),
+  minIntervalMs: parseInt(process.env.YOUTUBE_REQUEST_DELAY || '1000', 10)
 });
 module.exports.STATES = STATES;

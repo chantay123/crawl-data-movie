@@ -1,6 +1,9 @@
 /**
  * Test TMDB Integration
- * 
+ *
+ * ⭐ Trailer giờ CHỈ lấy từ YouTube Data API v3 (xem YouTubeService + TrailerService).
+ *    TMDB chỉ enrich metadata (vote/overview/poster/backdrop), KHÔNG fetch videos nữa.
+ *
  * Chạy: node scripts/test-tmdb.js
  */
 

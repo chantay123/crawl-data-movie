@@ -1,7 +1,11 @@
 /**
  * Test TMDB Enrichment End-to-End
- * 
+ *
  * Test toàn bộ flow: API → Enrich → Save → Verify
+ *
+ * ⭐ Trailer giờ CHỈ lấy từ YouTube Data API v3.
+ *    TMDB chỉ enrich metadata (vote/overview/poster/backdrop), KHÔNG fetch videos nữa.
+ *    Sau khi save, TrailerService sẽ tự động fetch trailer từ YouTube.
  */
 
 require('dotenv').config();
@@ -78,7 +82,7 @@ async function testEnrichment() {
       console.log(`      - ${name}`);
     });
     console.log('');
-    console.log('   Trailer:', enriched.trailerUrl || '(none)');
+    console.log('   ⭐ Trailer: TMDB KHÔNG fetch trailer nữa (YouTube-only)');
     console.log('   Poster:', enriched.posterUrl ? enriched.posterUrl.substring(0, 60) + '...' : '(none)');
     console.log('   Backdrop:', enriched.backdropUrl ? enriched.backdropUrl.substring(0, 60) + '...' : '(none)');
     console.log('');
@@ -120,7 +124,11 @@ async function testEnrichment() {
       console.log(`      - ${name}`);
     });
     console.log('');
-    console.log('   Trailer:', saved.trailerUrl || '❌ NOT SAVED');
+    console.log('   ⭐ Trailer: lấy từ YouTube (xem Movie.trailer)');
+    console.log(`      key: ${saved.trailer?.key || '❌ chưa có (sẽ fetch qua TrailerService.getTrailer)'}`);
+    console.log(`      url: ${saved.trailer?.url || '—'}`);
+    console.log(`      type: ${saved.trailer?.type || '—'}`);
+    console.log(`      trailerJobStatus: ${saved.trailerJobStatus}`);
     console.log('   Poster:', saved.posterUrl ? saved.posterUrl.substring(0, 60) + '...' : '❌ NOT SAVED');
     console.log('   Backdrop:', saved.backdropUrl ? saved.backdropUrl.substring(0, 60) + '...' : '❌ NOT SAVED');
     console.log('');
@@ -147,12 +155,12 @@ async function testEnrichment() {
     console.log('');
 
     // Final verdict
-    const allGood = 
-      saved.tmdbId &&
+    const allGood =
+      saved.tmdb?.id &&
       saved.actor.length > 1 &&
       saved.director.length > 0 &&
-      saved.trailerUrl &&
-      saved.tmdbVoteAverage > 0;
+      saved.trailer?.key &&  // trailer từ YouTube
+      saved.tmdb?.vote_average > 0;
 
     if (allGood) {
       console.log('🎉 SUCCESS! TMDB enrichment is working perfectly!');

@@ -44,7 +44,7 @@ const movieActorSchema = new Schema({
   },
   source: {
     type: String,
-    enum: ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'import'],
+    enum: ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'wikipedia', 'wikidata', 'import'],
     default: 'manual'
   }
 }, {
@@ -66,18 +66,29 @@ movieActorSchema.index({ isMain: 1 });
 
 // Add actor to movie
 movieActorSchema.statics.addActor = async function(movieId, actorId, options = {}) {
-  const existing = await this.findOne({ movieId, actorId });
-  if (existing) return existing;
-  
-  return await this.create({
-    movieId,
-    actorId,
-    role: options.role || 'supporting',
-    characterName: options.characterName || '',
-    order: options.order || 0,
-    isMain: options.isMain || false,
-    source: options.source || 'manual'
-  });
+  try {
+    const existing = await this.findOne({ movieId, actorId });
+    if (existing) return existing;
+
+    // Sanitize source — chỉ cho phép các giá trị trong enum
+    const ALLOWED_SOURCES = ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'wikipedia', 'wikidata', 'import'];
+    const rawSource = options.source || 'manual';
+    const source = ALLOWED_SOURCES.includes(rawSource) ? rawSource : 'manual';
+
+    return await this.create({
+      movieId,
+      actorId,
+      role: options.role || 'supporting',
+      characterName: options.characterName || '',
+      order: options.order || 0,
+      isMain: options.isMain || false,
+      source,
+    });
+  } catch (err) {
+    // KHÔNG throw — caller sẽ log warning và tiếp tục pipeline
+    console.warn(`[MovieActor.addActor] failed for movieId=${movieId} actorId=${actorId}: ${err.message}`);
+    return null;
+  }
 };
 
 // Remove actor from movie
@@ -108,26 +119,64 @@ movieActorSchema.statics.getActorMovies = async function(actorId, options = {}) 
 };
 
 // Set actors for a movie (replace all)
+// actors = [{ actorId, role, characterName, order, isMain, source }]
+//
+// QUY TẮC (theo yêu cầu):
+//   - Một actor lỗi KHÔNG được fail toàn bộ quá trình save
+//   - Sanitize `source` trước khi insert (loại bỏ giá trị không hợp lệ)
+//   - Dùng ordered:false để 1 row lỗi không rollback các row khác
 movieActorSchema.statics.setActors = async function(movieId, actors) {
-  // actors = [{ actorId, role, characterName, order, isMain }]
-  
   // Remove all existing
-  await this.deleteMany({ movieId });
-  
-  // Add new ones
+  try {
+    await this.deleteMany({ movieId });
+  } catch (err) {
+    console.warn(`[MovieActor.setActors] deleteMany failed for movieId=${movieId}: ${err.message}`);
+    // Tiếp tục — không throw
+  }
+
   if (!actors || actors.length === 0) return [];
-  
-  const docs = actors.map((actor, index) => ({
-    movieId,
-    actorId: actor.actorId,
-    role: actor.role || 'supporting',
-    characterName: actor.characterName || '',
-    order: actor.order !== undefined ? actor.order : index,
-    isMain: actor.isMain || false,
-    source: actor.source || 'manual'
-  }));
-  
-  return await this.insertMany(docs);
+
+  const ALLOWED_SOURCES = ['manual', 'ophim', 'kkphim', 'nguonc', 'tmdb', 'wikipedia', 'wikidata', 'import'];
+  const ALLOWED_ROLES = ['lead', 'supporting', 'cameo', 'extra', 'voice', 'other'];
+
+  // Lọc + sanitize TỪNG record. Nếu record không hợp lệ → bỏ qua, log warning.
+  const docs = [];
+  for (let index = 0; index < actors.length; index++) {
+    const actor = actors[index] || {};
+    if (!actor.actorId) {
+      console.warn(`[MovieActor.setActors] skip record[${index}]: missing actorId`);
+      continue;
+    }
+    const rawSource = actor.source || 'manual';
+    const source = ALLOWED_SOURCES.includes(rawSource) ? rawSource : 'manual';
+    const rawRole = actor.role || 'supporting';
+    const role = ALLOWED_ROLES.includes(rawRole) ? rawRole : 'supporting';
+
+    docs.push({
+      movieId,
+      actorId: actor.actorId,
+      role,
+      characterName: typeof actor.characterName === 'string' ? actor.characterName : '',
+      order: typeof actor.order === 'number' ? actor.order : index,
+      isMain: !!actor.isMain,
+      source,
+    });
+  }
+
+  if (docs.length === 0) return [];
+
+  try {
+    // ordered:false → nếu 1 row fail validation, các row khác vẫn insert thành công
+    return await this.insertMany(docs, { ordered: false });
+  } catch (err) {
+    // Có thể có vài row bị validation fail — log warning, trả về các row thành công
+    if (err && err.insertedDocs && Array.isArray(err.insertedDocs)) {
+      console.warn(`[MovieActor.setActors] partial insert for movieId=${movieId}: ${err.message}`);
+      return err.insertedDocs;
+    }
+    console.warn(`[MovieActor.setActors] insertMany failed for movieId=${movieId}: ${err.message}`);
+    return [];
+  }
 };
 
 // Get main cast for a movie

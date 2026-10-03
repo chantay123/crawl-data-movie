@@ -33,18 +33,70 @@ const {
 const TMDBService = require('./TMDBService');
 const WikipediaService = require('./WikipediaService');
 const TrailerService = require('./TrailerService');
+const ActorService = require('./ActorService');
+const DirectorService = require('./DirectorService');
+const WikidataService = require('./WikidataService');
 const logger = require('../utils/logger');
+
+// ============================================================================
+// PER-MOVIE SAVE LOCK (dedupe)
+//
+// Vấn đề: cùng 1 movie có thể tồn tại trên NHIỀU nguồn (OPhim + KKPhim + Nguonc).
+// Mỗi lần CrawlerService gọi saveMovie() cho cùng 1 slug → trailer bị xử lý lặp lại
+// (ghi nhận: "Như Đã Hẹn" bị process 3 lần trong 3 giây liên tiếp).
+//
+// Lock này đảm bảo: cùng 1 slug chỉ được save MỘT LẦN tại một thời điểm.
+// Lần gọi thứ 2+ sẽ nhận lại kết quả của lần đang chạy (dedup promise).
+// ============================================================================
+const saveInFlight = new Map(); // slug -> Promise
 
 class MovieService {
   /**
-   * Lưu hoặc cập nhật movie với đầy đủ relationships
-   * 
+   * Lưu hoặc cập nhật movie với đầy đủ relationships.
+   *
+   * ĐÂY LÀ WRAPPER CÓ DEDUPE: nếu cùng 1 slug đang được xử lý, lần gọi này sẽ
+   * nhận lại Promise của lần đang chạy thay vì xử lý lại (tránh process trùng).
+   * Với `force=true`, bỏ qua dedupe (dùng cho admin/manual).
+   *
    * @param {Object} movieData - Dữ liệu từ crawler (format OPhim/KKPhim/Nguonc)
    * @param {string} sourceName - Tên nguồn crawl
    * @param {boolean} enrichWithTMDB - Enrich data với TMDB (default: true)
-   * @returns {Object} { movie, isNew, categoriesAdded, countriesAdded, actorsAdded, directorsAdded }
+   * @param {Object} [opts]
+   * @param {boolean} [opts.force=false] Bỏ qua dedupe lock
+   * @returns {Promise<Object>} { movie, isNew, categoriesAdded, countriesAdded, actorsAdded, directorsAdded }
    */
-  async saveMovie(movieData, sourceName = 'unknown', enrichWithTMDB = true) {
+  async saveMovie(movieData, sourceName = 'unknown', enrichWithTMDB = true, opts = {}) {
+    const force = !!opts.force;
+    const slug = String(movieData?.slug || movieData?.sourceId || '').trim();
+
+    // Không có slug → không dedupe được, chạy thẳng
+    if (!slug || force) {
+      return this._saveMovieInternal(movieData, sourceName, enrichWithTMDB);
+    }
+
+    // Đang xử lý slug này rồi → trả về kết quả của lần đang chạy
+    if (saveInFlight.has(slug)) {
+      logger.debug(
+        `[MovieService] ⏭ DEDUPED save for "${slug}" — already in-flight, reusing result`
+      );
+      return saveInFlight.get(slug);
+    }
+
+    // Chưa xử lý → tạo promise và lưu vào map
+    const promise = this._saveMovieInternal(movieData, sourceName, enrichWithTMDB)
+      .finally(() => {
+        saveInFlight.delete(slug);
+      });
+
+    saveInFlight.set(slug, promise);
+    return promise;
+  }
+
+  /**
+   * Thân thật của saveMovie (KHÔNG dedupe).
+   * @private
+   */
+  async _saveMovieInternal(movieData, sourceName, enrichWithTMDB) {
     try {
       // 0. Enrich data với TMDB nếu enabled
       let enrichedData = movieData;
@@ -86,6 +138,16 @@ class MovieService {
         delete transformedData.trailer;
       }
 
+      // SAFETY NET (yêu cầu #4/#5): KHÔNG BAO GIỜ ghi trailer = null xuống DB.
+      // Nếu movie đã có trailer hợp lệ và request mới không tìm được → giữ trailer cũ.
+      // Nếu movie chưa có trailer → để field vắng mặt (null) để bước 4 có cơ hội fill.
+      if (!transformedData.trailer?.key) {
+        delete transformedData.trailer;
+        if (transformedData.tmdb && !transformedData.tmdb.trailer_url) {
+          delete transformedData.tmdb.trailer_url;
+        }
+      }
+
       // 2. Upsert Movie (tìm theo slug hoặc sourceId)
       // Dùng $set để chỉ cập nhật các field mới, giữ nguyên field cũ (view, rating, trailer...)
       const updateFields = {};
@@ -114,8 +176,19 @@ class MovieService {
       const countriesAdded = await this._processCountries(movie._id, enrichedData.country || []);
       
       // Pass tmdbCredits to actors/directors processing
-      const actorsAdded = await this._processActors(movie._id, enrichedData.actor || [], sourceName, tmdbCredits?.cast);
-      const directorsAdded = await this._processDirectors(movie._id, enrichedData.director || [], sourceName, tmdbCredits?.directors);
+      // Wrap trong try/catch để 1 actor lỗi không rollback toàn bộ movie save.
+      let actorsAdded = 0;
+      try {
+        actorsAdded = await this._processActors(movie._id, enrichedData.actor || [], sourceName, tmdbCredits?.cast);
+      } catch (actorErr) {
+        logger.warn(`[MovieService] _processActors threw for movieId=${movie._id}, continuing: ${actorErr.message}`);
+      }
+      let directorsAdded = 0;
+      try {
+        directorsAdded = await this._processDirectors(movie._id, enrichedData.director || [], sourceName, tmdbCredits?.directors);
+      } catch (dirErr) {
+        logger.warn(`[MovieService] _processDirectors threw for movieId=${movie._id}, continuing: ${dirErr.message}`);
+      }
       
       const yearsAdded = await this._processYears(movie._id, enrichedData.year, sourceName);
       const formatsAdded = await this._processFormats(movie._id, enrichedData.quality, sourceName);
@@ -124,8 +197,9 @@ class MovieService {
       // - Chưa có trailer field → fetch
       // - Có null trailer (no key) → fetch (cơ hội retry khi YouTube recover)
       // - Có real trailer (key='abc123') → skip
-      // TrailerService sẽ try YouTube → lưu real trailer HOẶC giữ null (không bao giờ lưu empty object).
-      // YouTube 429 KHÔNG crash crawler — Movie vẫn được lưu bình thường.
+      // ⭐ Trailer CHỈ lấy từ YouTube Data API v3 (yêu cầu #1).
+      // KHÔNG có TMDB fallback. YouTube 429 / circuit OPEN chỉ ảnh hưởng trailer
+      // của movie đó, KHÔNG chặn pipeline và KHÔNG crash movie import.
       let trailerResult = null;
       if (!movie.trailer || !movie.trailer.key) {
         try {
@@ -135,12 +209,41 @@ class MovieService {
         }
       }
 
+      // Đồng bộ lại document trong memory sau khi TrailerService đã ghi vào MongoDB,
+      // để log "Created/Updated movie" phản ánh ĐÚNG trạng thái đã persist
+      // (TrailerService.updateOne() không mutate object này).
+      if (trailerResult?.status === 'FOUND' && trailerResult.trailer?.key) {
+        const persisted = await Movie.findOne({ _id: movie._id })
+          .select('trailer')
+          .lean();
+        if (persisted?.trailer?.key) {
+          movie.trailer = persisted.trailer;
+        } else {
+          logger.warn(
+            `[MovieService] Trailer reported FOUND but not persisted for ${movie.slug} — ` +
+            `re-applying`
+          );
+          // updateOne có thể không match do filter bảo vệ → ghi lại bằng save()
+          movie.trailer = trailerResult.trailer;
+          movie.set('trailerJobStatus', 'OK');
+          movie.set('trailerRetryAt', null);
+          try {
+            await movie.save();
+          } catch (saveErr) {
+            logger.error(
+              `[MovieService] Failed to persist trailer for ${movie.slug}: ${saveErr.message}`
+            );
+          }
+        }
+      }
+
       logger.info(
         `${isNew ? 'Created' : 'Updated'} movie: ${movie.name} (${movie.slug}) ` +
         `[Cat: ${categoriesAdded}, Coun: ${countriesAdded}, Act: ${actorsAdded}, Dir: ${directorsAdded}, Year: ${yearsAdded}, Fmt: ${formatsAdded}` +
-        `${trailerResult?.status === 'FOUND' ? ', Trailer: ✅' :
+        `${trailerResult?.status === 'FOUND' ? `, Trailer: ✅(${trailerResult.source})` :
           trailerResult?.status === 'RATE_LIMITED' ? ', Trailer: ⏸RATE_LIMITED' :
-          trailerResult?.status === 'NOT_FOUND' ? ', Trailer: ⬜NONE' : ''}]`
+          trailerResult?.status === 'NOT_FOUND' ? ', Trailer: ⚠️NONE' :
+          trailerResult?.status === 'ERROR' ? ', Trailer: ⚠️ERROR' : ''}]`
       );
 
       return { movie, isNew, categoriesAdded, countriesAdded, actorsAdded, directorsAdded, yearsAdded, formatsAdded, trailerResult };
@@ -328,12 +431,17 @@ class MovieService {
     return countryIds.length;
   }
 
-  /**
-   * Process Actors: Create master data + junction table
-   * UPDATED: Ưu tiên dùng TMDB credits (có ảnh, vai diễn) nếu có
-   *         Fallback sang Wikipedia nếu TMDB thiếu ảnh/biography
-   */
-  async _processActors(movieId, actorNames, sourceName, tmdbCast = null) {
+/**
+ * Process Actors: Create master data + junction table
+ * UPDATED: Ưu tiên dùng TMDB credits (có ảnh, vai diễn) nếu có
+ *         Fallback sang Wikipedia nếu TMDB thiếu ảnh/biography
+ *
+ * QUY TẮC (theo yêu cầu):
+ *   - Một actor lỗi KHÔNG được fail toàn bộ movie
+ *   - source="wikidata" phải giữ nguyên, không bị convert
+ *   - Validation error trên MovieActor chỉ skip record đó, tiếp tục các record khác
+ */
+async _processActors(movieId, actorNames, sourceName, tmdbCast = null) {
     if (!actorNames || actorNames.length === 0) {
       // Nếu không có actorNames từ crawler nhưng có tmdbCast, dùng TMDB
       if (tmdbCast && tmdbCast.length > 0) {
@@ -343,28 +451,34 @@ class MovieService {
     }
 
     const actorRecords = [];
+    const logger = require('../utils/logger');
 
-    // Nếu có tmdbCast, match theo tên để lấy ảnh/thông tin
     for (let i = 0; i < actorNames.length; i++) {
       const name = actorNames[i];
       if (!name || typeof name !== 'string') continue;
 
+      // Wrap TỪNG actor trong try/catch — 1 actor lỗi không crash movie
       try {
         let actor;
-        
+
         // Tìm match trong tmdbCast theo tên (case-insensitive)
-        const tmdbMatch = tmdbCast?.find(c => 
+        const tmdbMatch = tmdbCast?.find(c =>
           c.name.toLowerCase() === name.trim().toLowerCase()
         );
 
         if (tmdbMatch) {
           // Có match TMDB → enrich với ảnh, biography (fetch details nếu cần)
-          const personDetails = await TMDBService.getPersonDetails(tmdbMatch.tmdbId);
-          const enrichedPerson = personDetails || tmdbMatch;
-          
+          let enrichedPerson = tmdbMatch;
+          try {
+            const personDetails = await TMDBService.getPersonDetails(tmdbMatch.tmdbId);
+            enrichedPerson = personDetails || tmdbMatch;
+          } catch (tmdbErr) {
+            logger.debug(`[TMDB] getPersonDetails failed for ${name}: ${tmdbErr.message}`);
+          }
+
           actor = await Actor.findOrCreateFromTMDB(enrichedPerson);
-          
-          // Fallback: Nếu TMDB không có ảnh hoặc biography, thử Wikipedia
+
+          // Fallback: Nếu TMDB không có ảnh hoặc biography, thử Wikipedia → Wikidata
           const config = require('../config');
           if (WikipediaService.enabled && config.wikipedia?.fallbackToWikiOnTMDBFail) {
             const needsMoreInfo = !enrichedPerson.profilePath && !enrichedPerson.biography;
@@ -372,13 +486,8 @@ class MovieService {
               try {
                 const wikiData = await WikipediaService.getActorData(name);
                 if (wikiData && wikiData.profileImage) {
-                  // Cập nhật Wikipedia data nếu TMDB thiếu
-                  if (!actor.profileImage) {
-                    actor.profileImage = wikiData.profileImage;
-                  }
-                  if (!actor.biography && wikiData.extract) {
-                    actor.biography = wikiData.extract;
-                  }
+                  if (!actor.profileImage) actor.profileImage = wikiData.profileImage;
+                  if (!actor.biography && wikiData.extract) actor.biography = wikiData.extract;
                   await actor.save();
                   logger.info(`[Wiki] ✅ Enriched actor from Wikipedia: ${name}`);
                 }
@@ -387,7 +496,24 @@ class MovieService {
               }
             }
           }
-          
+
+          // Wikidata fallback nếu actor vẫn thiếu ảnh/gender
+          if (
+            WikidataService.enabled &&
+            (!actor.profileImage || !actor.gender || actor.gender === 'unknown')
+          ) {
+            try {
+              const wkActor = await ActorService.enrichWithWikidata(name);
+              if (wkActor && wkActor._id) {
+                const fresh = await Actor.findById(actor._id);
+                if (fresh) actor = fresh;
+                logger.info(`[Wikidata] ✅ Enriched actor from Wikidata: ${name}`);
+              }
+            } catch (wdErr) {
+              logger.debug(`[Wikidata] fallback failed for ${name}: ${wdErr.message}`);
+            }
+          }
+
           actorRecords.push({
             actorId: actor._id,
             characterName: tmdbMatch.characterName || '',
@@ -405,28 +531,52 @@ class MovieService {
               logger.debug(`[Wiki] Search failed for actor: ${name}`);
             }
           }
-          
+
+          // resolvedSource mặc định = source crawler (ophim/kkphim/...)
+          // Sẽ bị override nếu Wikipedia hoặc Wikidata trả kết quả
+          let resolvedSource = sourceName;
           if (wikiData) {
             actor = await Actor.findOrCreateFromWikipedia(wikiData);
             logger.info(`[Wiki] ✅ Created actor from Wikipedia: ${name}`);
-          } else {
-            // Không có cả TMDB và Wikipedia → tạo actor bình thường (chỉ có tên)
+            resolvedSource = 'wikipedia';
+          } else if (WikidataService.enabled) {
+            // Fallback: thử Wikidata (ưu tiên dữ liệu: TMDB → Wikipedia → Wikidata)
+            try {
+              const wkActor = await ActorService.enrichWithWikidata(name);
+              if (wkActor && wkActor._id) {
+                actor = wkActor;
+                resolvedSource = 'wikidata'; // ← giữ nguyên, KHÔNG convert
+                logger.info(`[Wikidata] ✅ Created actor from Wikidata: ${name}`);
+              }
+            } catch (wdErr) {
+              logger.debug(`[Wikidata] fallback failed for ${name}: ${wdErr.message}`);
+            }
+          }
+
+          if (!actor) {
+            // Không có cả TMDB, Wikipedia và Wikidata → tạo actor bình thường (chỉ có tên)
             actor = await Actor.findOrCreate(name.trim());
           }
           actorRecords.push({
             actorId: actor._id,
             order: i,
-            source: wikiData ? 'wikipedia' : sourceName,
+            source: resolvedSource,
             isMain: i < 5
           });
         }
       } catch (err) {
-        logger.warn(`Failed to create actor ${name}: ${err.message}`);
+        // KHÔNG throw — log warning và tiếp tục actor/movie tiếp theo
+        logger.warn(`[MovieService] Failed to create actor "${name}" (skipped): ${err.message}`);
       }
     }
 
     if (actorRecords.length > 0) {
-      await MovieActor.setActors(movieId, actorRecords);
+      // setActors đã có try/catch + ordered:false bên trong, nhưng vẫn wrap để chắc chắn
+      try {
+        await MovieActor.setActors(movieId, actorRecords);
+      } catch (err) {
+        logger.warn(`[MovieService] setActors failed for movieId=${movieId}: ${err.message}`);
+      }
     }
 
     return actorRecords.length;
@@ -434,17 +584,42 @@ class MovieService {
 
   /**
    * Process actors từ TMDB credits (khi crawler không có actorNames)
+   * QUY TẮC: mỗi actor trong try/catch riêng → 1 actor fail không crash movie.
    */
   async _processActorsFromTMDB(movieId, tmdbCast, sourceName) {
     const actorRecords = [];
+    const logger = require('../utils/logger');
 
     for (const tmdbPerson of tmdbCast.slice(0, 20)) { // Giới hạn 20 diễn viên
       try {
         // Fetch chi tiết biography/ngày sinh (optional, có thể bỏ để tăng tốc)
-        const personDetails = await TMDBService.getPersonDetails(tmdbPerson.tmdbId);
-        const enrichedPerson = personDetails || tmdbPerson;
+        let enrichedPerson = tmdbPerson;
+        try {
+          const personDetails = await TMDBService.getPersonDetails(tmdbPerson.tmdbId);
+          enrichedPerson = personDetails || tmdbPerson;
+        } catch (tmdbErr) {
+          logger.debug(`[TMDB] getPersonDetails failed for ${tmdbPerson.name}: ${tmdbErr.message}`);
+        }
 
         const actor = await Actor.findOrCreateFromTMDB(enrichedPerson);
+
+        // Wikidata fallback nếu actor vẫn thiếu ảnh/gender
+        if (
+          WikidataService.enabled &&
+          (!actor.profileImage || !actor.gender || actor.gender === 'unknown')
+        ) {
+          try {
+            const wkActor = await ActorService.enrichWithWikidata(tmdbPerson.name);
+            if (wkActor && wkActor._id) {
+              const fresh = await Actor.findById(actor._id);
+              if (fresh) actor = fresh;
+              logger.info(`[Wikidata] ✅ Enriched actor from Wikidata: ${tmdbPerson.name}`);
+            }
+          } catch (wdErr) {
+            logger.debug(`[Wikidata] fallback failed for ${tmdbPerson.name}: ${wdErr.message}`);
+          }
+        }
+
         actorRecords.push({
           actorId: actor._id,
           characterName: tmdbPerson.characterName || '',
@@ -453,12 +628,17 @@ class MovieService {
           isMain: tmdbPerson.order < 5
         });
       } catch (err) {
-        logger.warn(`Failed to create actor from TMDB ${tmdbPerson.name}: ${err.message}`);
+        // 1 actor fail không crash movie
+        logger.warn(`[MovieService] Failed to create actor from TMDB "${tmdbPerson.name}" (skipped): ${err.message}`);
       }
     }
 
     if (actorRecords.length > 0) {
-      await MovieActor.setActors(movieId, actorRecords);
+      try {
+        await MovieActor.setActors(movieId, actorRecords);
+      } catch (err) {
+        logger.warn(`[MovieService] setActors failed for movieId=${movieId}: ${err.message}`);
+      }
     }
 
     return actorRecords.length;
@@ -468,6 +648,12 @@ class MovieService {
    * Process Directors: Create master data + junction table
    * UPDATED: Ưu tiên dùng TMDB credits (có ảnh, biography) nếu có
    *         Fallback sang Wikipedia nếu TMDB thiếu ảnh/biography
+   *         Fallback cuối cùng: Wikidata (cho cả TMDB-match và direct-name path)
+   *
+   * QUY TẮC (theo yêu cầu):
+   *   - Một director lỗi KHÔNG được fail toàn bộ movie
+   *   - source="wikidata" phải giữ nguyên, không bị convert
+   *   - Validation error trên MovieDirector chỉ skip record đó, tiếp tục các record khác
    */
   async _processDirectors(movieId, directorNames, sourceName, tmdbDirectors = null) {
     if (!directorNames || directorNames.length === 0) {
@@ -479,40 +665,42 @@ class MovieService {
     }
 
     const directorRecords = [];
+    const config = require('../config');
 
     for (let i = 0; i < directorNames.length; i++) {
       const name = directorNames[i];
       if (!name || typeof name !== 'string') continue;
 
+      // Wrap TỪNG director trong try/catch — 1 director lỗi không crash movie
       try {
         let director;
-        
-        // Tìm match trong tmdbDirectors theo tên
-        const tmdbMatch = tmdbDirectors?.find(d => 
+
+        // Tìm match trong tmdbDirectors theo tên (case-insensitive)
+        const tmdbMatch = tmdbDirectors?.find(d =>
           d.name.toLowerCase() === name.trim().toLowerCase()
         );
 
         if (tmdbMatch) {
           // Có match TMDB → enrich với ảnh, biography
-          const personDetails = await TMDBService.getPersonDetails(tmdbMatch.tmdbId);
-          const enrichedPerson = personDetails || tmdbMatch;
-          
+          let enrichedPerson = tmdbMatch;
+          try {
+            const personDetails = await TMDBService.getPersonDetails(tmdbMatch.tmdbId);
+            enrichedPerson = personDetails || tmdbMatch;
+          } catch (tmdbErr) {
+            logger.debug(`[TMDB] getPersonDetails failed for director ${name}: ${tmdbErr.message}`);
+          }
+
           director = await Director.findOrCreateFromTMDB(enrichedPerson);
-          
+
           // Fallback: Nếu TMDB không có ảnh hoặc biography, thử Wikipedia
-          const config = require('../config');
           if (WikipediaService.enabled && config.wikipedia?.fallbackToWikiOnTMDBFail) {
             const needsMoreInfo = !enrichedPerson.profilePath && !enrichedPerson.biography;
             if (needsMoreInfo) {
               try {
                 const wikiData = await WikipediaService.getDirectorData(name);
                 if (wikiData && wikiData.profileImage) {
-                  if (!director.profileImage) {
-                    director.profileImage = wikiData.profileImage;
-                  }
-                  if (!director.biography && wikiData.extract) {
-                    director.biography = wikiData.extract;
-                  }
+                  if (!director.profileImage) director.profileImage = wikiData.profileImage;
+                  if (!director.biography && wikiData.extract) director.biography = wikiData.extract;
                   await director.save();
                   logger.info(`[Wiki] ✅ Enriched director from Wikipedia: ${name}`);
                 }
@@ -521,7 +709,24 @@ class MovieService {
               }
             }
           }
-          
+
+          // Wikidata fallback nếu director vẫn thiếu ảnh / gender / dateOfBirth
+          if (
+            WikidataService.enabled &&
+            (!director.profileImage || !director.gender || director.gender === 'unknown')
+          ) {
+            try {
+              const wkDirector = await DirectorService.enrichWithWikidata(name);
+              if (wkDirector && wkDirector._id) {
+                const fresh = await Director.findById(director._id);
+                if (fresh) director = fresh;
+                logger.info(`[Wikidata] ✅ Enriched director from Wikidata: ${name}`);
+              }
+            } catch (wdErr) {
+              logger.debug(`[Wikidata] fallback failed for director ${name}: ${wdErr.message}`);
+            }
+          }
+
           directorRecords.push({
             directorId: director._id,
             order: i,
@@ -538,28 +743,51 @@ class MovieService {
               logger.debug(`[Wiki] Search failed for director: ${name}`);
             }
           }
-          
+
+          // resolvedSource mặc định = source crawler (ophim/kkphim/...)
+          // Sẽ bị override nếu Wikipedia hoặc Wikidata trả kết quả
+          let resolvedSource = sourceName;
           if (wikiData) {
             director = await Director.findOrCreateFromWikipedia(wikiData);
             logger.info(`[Wiki] ✅ Created director from Wikipedia: ${name}`);
-          } else {
-            // Không có cả TMDB và Wikipedia → tạo director bình thường (chỉ có tên)
+            resolvedSource = 'wikipedia';
+          } else if (WikidataService.enabled) {
+            // Fallback cuối: thử Wikidata
+            try {
+              const wkDirector = await DirectorService.enrichWithWikidata(name);
+              if (wkDirector && wkDirector._id) {
+                director = wkDirector;
+                resolvedSource = 'wikidata'; // ← giữ nguyên, KHÔNG convert
+                logger.info(`[Wikidata] ✅ Created director from Wikidata: ${name}`);
+              }
+            } catch (wdErr) {
+              logger.debug(`[Wikidata] fallback failed for director ${name}: ${wdErr.message}`);
+            }
+          }
+
+          if (!director) {
+            // Không có cả TMDB, Wikipedia và Wikidata → tạo director bình thường (chỉ có tên)
             director = await Director.findOrCreate(name.trim());
           }
           directorRecords.push({
             directorId: director._id,
             order: i,
-            source: wikiData ? 'wikipedia' : sourceName,
+            source: resolvedSource,
             isMain: true
           });
         }
       } catch (err) {
-        logger.warn(`Failed to create director ${name}: ${err.message}`);
+        // KHÔNG throw — log warning và tiếp tục director/movie tiếp theo
+        logger.warn(`[MovieService] Failed to create director "${name}" (skipped): ${err.message}`);
       }
     }
 
     if (directorRecords.length > 0) {
-      await MovieDirector.setDirectors(movieId, directorRecords);
+      try {
+        await MovieDirector.setDirectors(movieId, directorRecords);
+      } catch (err) {
+        logger.warn(`[MovieService] setDirectors failed for movieId=${movieId}: ${err.message}`);
+      }
     }
 
     return directorRecords.length;
@@ -567,18 +795,43 @@ class MovieService {
 
   /**
    * Process directors từ TMDB credits (khi crawler không có directorNames)
+   * QUY TẮC: mỗi director trong try/catch riêng → 1 director fail không crash movie.
+   * Wikidata fallback: nếu director thiếu ảnh / gender / dateOfBirth → thử enrich.
    */
   async _processDirectorsFromTMDB(movieId, tmdbDirectors, sourceName) {
     const directorRecords = [];
 
     for (let i = 0; i < tmdbDirectors.length; i++) {
       const tmdbPerson = tmdbDirectors[i];
-      
+
       try {
-        const personDetails = await TMDBService.getPersonDetails(tmdbPerson.tmdbId);
-        const enrichedPerson = personDetails || tmdbPerson;
+        let enrichedPerson = tmdbPerson;
+        try {
+          const personDetails = await TMDBService.getPersonDetails(tmdbPerson.tmdbId);
+          enrichedPerson = personDetails || tmdbPerson;
+        } catch (tmdbErr) {
+          logger.debug(`[TMDB] getPersonDetails failed for director ${tmdbPerson.name}: ${tmdbErr.message}`);
+        }
 
         const director = await Director.findOrCreateFromTMDB(enrichedPerson);
+
+        // Wikidata fallback nếu director vẫn thiếu ảnh / gender / dateOfBirth
+        if (
+          WikidataService.enabled &&
+          (!director.profileImage || !director.gender || director.gender === 'unknown')
+        ) {
+          try {
+            const wkDirector = await DirectorService.enrichWithWikidata(tmdbPerson.name);
+            if (wkDirector && wkDirector._id) {
+              const fresh = await Director.findById(director._id);
+              if (fresh) director = fresh;
+              logger.info(`[Wikidata] ✅ Enriched director from Wikidata: ${tmdbPerson.name}`);
+            }
+          } catch (wdErr) {
+            logger.debug(`[Wikidata] fallback failed for director ${tmdbPerson.name}: ${wdErr.message}`);
+          }
+        }
+
         directorRecords.push({
           directorId: director._id,
           order: i,
@@ -586,12 +839,16 @@ class MovieService {
           isMain: true
         });
       } catch (err) {
-        logger.warn(`Failed to create director from TMDB ${tmdbPerson.name}: ${err.message}`);
+        logger.warn(`[MovieService] Failed to create director from TMDB "${tmdbPerson.name}" (skipped): ${err.message}`);
       }
     }
 
     if (directorRecords.length > 0) {
-      await MovieDirector.setDirectors(movieId, directorRecords);
+      try {
+        await MovieDirector.setDirectors(movieId, directorRecords);
+      } catch (err) {
+        logger.warn(`[MovieService] setDirectors failed for movieId=${movieId}: ${err.message}`);
+      }
     }
 
     return directorRecords.length;

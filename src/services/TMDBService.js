@@ -4,12 +4,13 @@
  * Features:
  * - Search movies by title
  * - Get movie details (actors, crew, etc.)
- * - Get movie videos (trailers)
  * - NO Keep-Alive (tắt connection reuse để tránh ECONNRESET từ Cloudflare/TMDB)
  * - Retry with exponential backoff + agent reset (1s → 2s → 4s → 8s)
  * - Rate limiting: 300-500ms delay giữa các request
  * - Concurrency limit (1 request tại một thời điểm)
  * - Graceful error handling (TMDB errors don't crash crawler)
+ * 
+ * ⚠️ Trailer (YouTube) được lấy riêng qua YouTubeService. KHÔNG dùng TMDB cho trailer.
  * 
  * API Documentation: https://developers.themoviedb.org/3
  */
@@ -75,7 +76,22 @@ class TMDBService {
   }
 
   /**
-   * FIXED: Concurrency-controlled request queue
+   * Parse `Retry-After` header (delta-seconds hoặc HTTP-date) → milliseconds.
+   * Trả về null nếu header không tồn tại / không parse được.
+   * @param {string} header
+   * @returns {number|null}
+   */
+  _parseRetryAfter(header) {
+    if (!header) return null;
+    const num = parseInt(header, 10);
+    if (!isNaN(num) && num >= 0) return num * 1000;
+    const dateMs = Date.parse(header);
+    if (!isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+    return null;
+  }
+
+  /**
+   * Concurrency-controlled request queue
    */
   async _queueRequest(requestFn) {
     return new Promise((resolve, reject) => {
@@ -275,93 +291,58 @@ class TMDBService {
   }
 
   /**
-   * REFACTORED: Get movie videos (trailers) with fresh client per request
-   * @param {number} tmdbId - TMDB movie ID
-   * @returns {Array} Array of trailer objects (empty if error)
+   * Map raw TMDB `/videos` response → array of YouOnly trailer objects.
+   * NOTE: Hiện KHÔNG còn được sử dụng (trailer giờ chỉ lấy từ YouTube).
+   * Giữ lại để tương thích với các test script cũ và cho mục đích debug.
+   *
+   * @deprecated Chỉ còn dùng trong script test, KHÔNG dùng trong flow trailer.
+   * @param {Object} data - response.data từ TMDB
+   * @param {number|string} tmdbId
+   * @param {'movie'|'tv'} mediaType
+   * @returns {Array}
    */
-  async getMovieVideos(tmdbId) {
-    if (!this.enabled) {
-      logger.debug(`[TMDB] Service disabled, skip videos for ${tmdbId}`);
+  _mapVideoResults(data, tmdbId, mediaType = 'movie') {
+    const videos = data?.results || [];
+
+    if (videos.length === 0) {
+      logger.debug(`[TMDB] No videos found for ${mediaType}: ${tmdbId}`);
       return [];
     }
 
-    if (!tmdbId) {
-      logger.warn('[TMDB] Missing tmdbId for video fetch');
+    // Filter YouTube videos that actually have a key
+    const youtubeVideos = videos.filter((v) => v.site === 'YouTube' && v.key);
+
+    if (youtubeVideos.length === 0) {
+      logger.debug(
+        `[TMDB] No usable YouTube videos (total: ${videos.length}) for ${mediaType}: ${tmdbId}`
+      );
       return [];
     }
 
-    try {
-      return await this._queueRequest(async (client) => {
-        logger.debug(`[TMDB] Fetching videos for movie: ${tmdbId}`);
-        
-        // Use English language to get more trailers
-        const response = await client.get(`/movie/${tmdbId}/videos`, {
-          params: {
-            language: 'en-US',
-          },
-        });
-        
-        // Handle non-200 status codes
-        if (response.status === 404) {
-          logger.warn(`[TMDB] Movie ${tmdbId} not found (404)`);
-          return [];
-        }
-        
-        if (response.status !== 200) {
-          logger.warn(`[TMDB] Videos API returned status ${response.status} for movie: ${tmdbId}`);
-          return [];
-        }
+    const trailers = youtubeVideos.map((v) => ({
+      key: v.key,
+      name: v.name || '',
+      type: v.type || 'Trailer',
+      site: v.site || 'YouTube',
+      official: v.official || false,
+      publishedAt: v.published_at || null,
+      url: v.key ? `https://www.youtube.com/watch?v=${v.key}` : '',
+    }));
 
-        const videos = response.data.results || [];
-
-        if (videos.length === 0) {
-          logger.debug(`[TMDB] No videos found for movie: ${tmdbId}`);
-          return [];
-        }
-
-        // Filter YouTube videos only
-        const youtubeVideos = videos.filter(v => v.site === 'YouTube');
-        
-        if (youtubeVideos.length === 0) {
-          logger.debug(`[TMDB] No YouTube videos (total: ${videos.length}) for movie: ${tmdbId}`);
-          return [];
-        }
-
-        // Map all YouTube videos
-        const trailers = youtubeVideos.map(v => ({
-          key: v.key || '',
-          name: v.name || '',
-          type: v.type || 'Trailer',
-          site: v.site || 'YouTube',
-          official: v.official || false,
-          publishedAt: v.published_at || null,
-          url: v.key ? `https://www.youtube.com/watch?v=${v.key}` : '',
-        }));
-
-        logger.info(`[TMDB] ✅ Found ${trailers.length} YouTube videos for movie: ${tmdbId}`);
-        return trailers;
-      });
-    } catch (error) {
-      // FIXED: Don't crash crawler, just log and return empty array
-      const isNetworkError = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND'].includes(error.code);
-      
-      if (isNetworkError) {
-        logger.error(`[TMDB] ⚠️  Network error fetching videos for ${tmdbId}: ${error.code}`);
-      } else if (error.response?.status === 404) {
-        logger.debug(`[TMDB] Movie not found: ${tmdbId}`);
-      } else if (error.response?.status === 401) {
-        logger.error('[TMDB] ❌ Invalid API key');
-      } else {
-        logger.error(`[TMDB] ⚠️  Get videos failed for ${tmdbId}: ${error.message}`);
-      }
-      
-      return []; // Return empty array, don't crash
-    }
+    logger.info(
+      `[TMDB] ✅ Found ${trailers.length} YouTube videos for ${mediaType}: ${tmdbId}`
+    );
+    return trailers;
   }
 
   /**
    * Get best trailer from videos array
    * Priority: Official Trailer > Trailer > Official Teaser > Other
+   *
+   * NOTE: Hiện KHÔNG còn được sử dụng (trailer giờ chỉ lấy từ YouTube qua YouTubeService).
+   * Giữ lại để tương thích với các test script cũ.
+   *
+   * @deprecated Chỉ còn dùng trong script test, KHÔNG dùng trong flow trailer.
    * @param {Array} videos - Array of video objects
    * @returns {Object|null} Best trailer object
    */
@@ -512,14 +493,12 @@ class TMDBService {
         return movieData; // Return original data, don't crash
       }
 
-      // Step 2: Get videos (trailers) using tmdbId
-      logger.debug(`[TMDB] Fetching videos for tmdbId: ${searchResult.tmdbId}`);
-      const videos = await this.getMovieVideos(searchResult.tmdbId);
-      
-      // Step 3: Get best trailer
-      const bestTrailer = this.getBestTrailer(videos);
+      // ⭐ Step 2 (đã bỏ): Trailer KHÔNG còn lấy từ TMDB.
+      // Trailer giờ CHỈ lấy từ YouTube Data API v3 (xem YouTubeService + TrailerService).
+      // Trước đây gọi hàm fetch videos TMDB + chọn best trailer để fill vào `trailer`.
+      // Nay bỏ để đảm bảo: TMDB chỉ enrich metadata (vote/overview/poster/backdrop).
 
-      // Step 4: Enrich movie data
+      // Step 3: Enrich movie data
       const enriched = {
         ...movieData,
         
@@ -530,19 +509,11 @@ class TMDBService {
           season: null,
           vote_average: searchResult.voteAverage || 0,
           vote_count: searchResult.voteCount || 0,
-          trailer_url: bestTrailer ? bestTrailer.url : ''
+          trailer_url: ''  // (đã bỏ) trailer_url không còn được fill từ TMDB
         },
-        
-        // Trailer structured data
-        trailer: bestTrailer ? {
-          name: bestTrailer.name,
-          key: bestTrailer.key,
-          site: bestTrailer.site,
-          type: bestTrailer.type,
-          official: bestTrailer.official,
-          publishedAt: bestTrailer.publishedAt,
-          url: bestTrailer.url,
-        } : null, // null if no trailer found
+
+        // ⭐ KHÔNG ghi đè `trailer` ở đây — để YouTubeService tự xử lý sau khi saveMovie().
+        // Nếu input (crawler) đã có sẵn `trailer` thì giữ nguyên (giữ behavior cũ).
         
         // Content
         content: searchResult.overview || movieData.content,
@@ -558,7 +529,7 @@ class TMDBService {
 
       logger.info(
         `[TMDB] ✅ Enriched "${movieData.name}": ` +
-        `tmdbId=${searchResult.tmdbId}, videos=${videos.length}, trailer=${bestTrailer ? 'YES' : 'NO'}`
+        `tmdbId=${searchResult.tmdbId} (trailer will be fetched via YouTube)`
       );
 
       return enriched;

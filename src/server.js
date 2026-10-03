@@ -151,8 +151,8 @@ app.get('/movies/:slug', async (req, res, next) => {
     const movie = await Movie.findOne({ slug: req.params.slug }).lean();
     if (!movie) return res.status(404).json({ error: 'Movie not found', slug: req.params.slug });
 
-    // Get trailer if not cached (key missing)
-    if (movie.tmdb?.id && !movie.trailer?.key) {
+    // Get trailer if not cached (key missing). YouTube là nguồn duy nhất.
+    if (!movie.trailer?.key) {
       const TrailerService = require('./services/TrailerService');
       const result = await TrailerService.getTrailer(movie);
       if (result && result.status === 'FOUND') {
@@ -284,6 +284,28 @@ app.get('/youtube/status', (_req, res) => {
     res.json(rateLimiter.status());
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Trailer pipeline diagnostics ---------------------------------
+app.get('/trailers/status', async (_req, res) => {
+  try {
+    const TrailerService = require('./services/TrailerService');
+    res.json(await TrailerService.getStats());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reset in-memory trailer state (locks / cooldowns).
+// Dùng khi muốn ép retry ngay mà không cần restart process.
+app.post('/trailers/reset-state', (_req, res) => {
+  try {
+    const trailerState = require('./utils/trailerState');
+    trailerState.reset();
+    res.json({ success: true, message: 'Trailer state reset (locks, cooldowns)' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

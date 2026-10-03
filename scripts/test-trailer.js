@@ -1,12 +1,14 @@
 /**
- * Test TMDB Trailer Enrichment
- * Kiểm tra xem trailer có được lưu vào database không
+ * Test YouTube Trailer Enrichment
+ * Kiểm tra xem trailer (YouTube) có được lưu vào database không.
+ *
+ * ⭐ Trailer giờ CHỈ lấy từ YouTube Data API v3 (yêu cầu #1).
  */
 
 require('dotenv').config();
 const mongoose = require('mongoose');
-const TMDBService = require('../src/services/TMDBService');
 const MovieService = require('../src/services/MovieService');
+const YouTubeService = require('../src/services/YouTubeService');
 const { Movie } = require('../src/models');
 const logger = require('../src/utils/logger');
 
@@ -16,8 +18,8 @@ async function testTrailer() {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log('✅ Connected to MongoDB\n');
 
-    // 2. Test TMDB enrichment
-    console.log('🎬 Testing TMDB Enrichment...');
+    // 2. Test YouTube trailer search
+    console.log('🎬 Testing YouTube Trailer Enrichment...');
     console.log('================================\n');
 
     const testMovie = {
@@ -29,22 +31,28 @@ async function testTrailer() {
       origin_name: 'Avengers: Endgame',
     };
 
-    // Enrich with TMDB
-    const enriched = await TMDBService.enrichMovieData(testMovie);
+    // Search YouTube cho trailer (NGUỒN DUY NHẤT)
+    const trailer = await YouTubeService.searchTrailer(
+      testMovie.name,
+      testMovie.year,
+      testMovie.origin_name
+    );
 
-    console.log('📋 Enriched Data:');
-    console.log('  - TMDB ID:', enriched.tmdbId);
-    console.log('  - Trailer URL:', enriched.trailerUrl);
-    console.log('  - Poster URL:', enriched.posterUrl?.substring(0, 60) + '...');
-    console.log('  - Backdrop URL:', enriched.backdropUrl?.substring(0, 60) + '...');
-    console.log('  - Actors:', enriched.actor?.slice(0, 3).join(', '));
-    console.log('  - Director:', enriched.director?.join(', '));
-    console.log('  - TMDB Videos:', enriched._tmdbData?.videos?.length || 0);
+    console.log('📋 Trailer từ YouTube:');
+    if (trailer && trailer.key) {
+      console.log(`  - Name: ${trailer.name}`);
+      console.log(`  - Key: ${trailer.key}`);
+      console.log(`  - Type: ${trailer.type}`);
+      console.log(`  - Official: ${trailer.official}`);
+      console.log(`  - URL: ${trailer.url}`);
+    } else {
+      console.log('  - Không tìm thấy trailer (NOT_FOUND — không phải lỗi)');
+    }
     console.log('');
 
-    // 3. Save to database
+    // 3. Save to database (skip TMDB enrichment để chỉ test trailer)
     console.log('💾 Saving to database...');
-    const result = await MovieService.saveMovie(enriched, 'test', false); // false = skip re-enrichment
+    const result = await MovieService.saveMovie(testMovie, 'test', false);
 
     console.log('✅ Saved:', result.movie.name);
     console.log('');
@@ -52,53 +60,48 @@ async function testTrailer() {
     // 4. Check database
     console.log('🔍 Checking database...');
     const saved = await Movie.findOne({ slug: 'avengers-endgame-test' }).lean();
-    
+
     console.log('📦 Database Record:');
     console.log('  - Name:', saved.name);
-    console.log('  - TMDB ID:', saved.tmdbId);
-    console.log('  - Trailer URL:', saved.trailerUrl || '❌ EMPTY');
-    console.log('  - Poster URL:', saved.posterUrl?.substring(0, 60) + '...');
-    console.log('  - Backdrop URL:', saved.backdropUrl?.substring(0, 60) + '...');
-    console.log('  - Actors:', saved.actor?.slice(0, 3).join(', '));
-    console.log('  - Director:', saved.director?.join(', '));
+    console.log('  - Trailer.key:', saved.trailer?.key || '❌ EMPTY');
+    console.log('  - Trailer.url:', saved.trailer?.url || '❌ EMPTY');
+    console.log('  - Trailer.type:', saved.trailer?.type);
+    console.log('  - Trailer.official:', saved.trailer?.official);
+    console.log('  - trailerJobStatus:', saved.trailerJobStatus);
     console.log('');
 
     // 5. Check all movies with trailers
     console.log('📊 Statistics:');
     const totalMovies = await Movie.countDocuments();
-    const moviesWithTrailer = await Movie.countDocuments({ 
-      trailerUrl: { $exists: true, $ne: '' } 
+    const moviesWithTrailer = await Movie.countDocuments({
+      'trailer.key': { $exists: true, $ne: '' }
     });
-    const moviesWithTMDB = await Movie.countDocuments({ 
-      tmdbId: { $exists: true, $ne: null } 
+    const moviesRATE_LIMITED = await Movie.countDocuments({
+      trailerJobStatus: 'RATE_LIMITED'
     });
 
     console.log(`  - Total movies: ${totalMovies}`);
-    console.log(`  - Movies with TMDB ID: ${moviesWithTMDB}`);
     console.log(`  - Movies with trailer: ${moviesWithTrailer}`);
+    console.log(`  - Movies RATE_LIMITED: ${moviesRATE_LIMITED}`);
     console.log('');
 
-    // 6. Show sample movies with trailers
-    if (moviesWithTrailer > 0) {
-      console.log('🎥 Sample movies with trailers:');
-      const samples = await Movie.find({ 
-        trailerUrl: { $exists: true, $ne: '' } 
-      })
-      .select('name trailerUrl')
-      .limit(5)
-      .lean();
-
-      samples.forEach((m, i) => {
-        console.log(`  ${i + 1}. ${m.name}`);
-        console.log(`     ${m.trailerUrl}`);
-      });
+    console.log('='.repeat(60));
+    if (saved.trailer?.key) {
+      console.log('✅ TRAILER TEST PASSED — YouTube trailer đã lưu vào Movie');
+    } else {
+      console.log('⚠️  No trailer saved (có thể YouTube bị rate-limit hoặc không tìm thấy)');
     }
-
-    console.log('\n✅ Test completed!');
+    console.log('='.repeat(60));
 
   } catch (error) {
-    console.error('❌ Error:', error.message);
-    console.error(error.stack);
+    console.error('\n❌ ERROR:', error.message);
+    if (error.code === 'RATE_LIMITED' || error.status === 429) {
+      console.error('\n🔧 YouTube rate-limited (429). Chờ cooldown rồi thử lại.');
+    } else if (error.code === 'QUOTA_EXCEEDED') {
+      console.error('\n🔧 YouTube daily quota exceeded. Reset lúc 00:00 PT.');
+    } else if (error.code === 'CIRCUIT_OPEN') {
+      console.error('\n🔧 Circuit breaker OPEN. Chờ cooldown rồi thử lại.');
+    }
   } finally {
     await mongoose.disconnect();
   }
