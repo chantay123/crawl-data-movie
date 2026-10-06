@@ -71,6 +71,28 @@ module.exports = {
     circuitCooldownMs: toInt(process.env.YOUTUBE_CIRCUIT_COOLDOWN_MS, 900000),
     requestTimeoutMs: toInt(process.env.YOUTUBE_REQUEST_TIMEOUT_MS, 10000),
   },
+
+  // ====================================================================
+  // Trailer batch job configuration (sequential, batch + delay + cooldown)
+  // ====================================================================
+  // Batch job chạy SEQUENTIAL (không parallel) để tránh YouTube API 429/RATE_LIMITED.
+  // Mỗi batch xử lý `batchSize` phim, sleep `batchPauseMs` giữa các batch.
+  // Giữa mỗi phim delay ngẫu nhiên [movieDelayMinMs, movieDelayMaxMs] ms.
+  // Khi gặp 429/RATE_LIMITED → dừng batch hiện tại, sleep `rateLimitCooldownMs`,
+  // rồi tiếp tục các phim chưa xử lý.
+  trailerBatch: {
+    // Chỉ chấp nhận {10, 20, 30, 40}. Anything else falls back to 10.
+    batchSize: toInt(process.env.TRAILER_BATCH_SIZE, 10),
+    // Sleep 60 giây giữa các batch (ms)
+    batchPauseMs: toInt(process.env.TRAILER_BATCH_PAUSE_MS, 60_000),
+    // Delay ngẫu nhiên giữa mỗi phim trong cùng batch (ms)
+    movieDelayMinMs: toInt(process.env.TRAILER_MOVIE_DELAY_MIN_MS, 3_000),
+    movieDelayMaxMs: toInt(process.env.TRAILER_MOVIE_DELAY_MAX_MS, 8_000),
+    // Cooldown khi gặp 429/RATE_LIMITED (ms) - mặc định 30 phút
+    rateLimitCooldownMs: toInt(process.env.TRAILER_RATE_LIMIT_COOLDOWN_MS, 30 * 60_000),
+    // Số phim tối đa xử lý trong 1 lần chạy batch (0 = không giới hạn, dùng batchSize làm cap)
+    maxMoviesPerRun: toInt(process.env.TRAILER_MAX_MOVIES_PER_RUN, 200),
+  },
   
   // Wikipedia API configuration (không cần API key)
   wikipedia: {

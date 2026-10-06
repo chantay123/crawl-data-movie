@@ -255,16 +255,21 @@ app.post('/movies/:slug/trailer/fetch', async (req, res, next) => {
 
 app.post('/trailers/batch-update', async (req, res, next) => {
   try {
-    const limit = parseInt(req.body.limit) || 50;
+    // Backward-compat: accept either a numeric `limit` or the new option set.
+    const limit = parseInt(req.body.limit) || 0;
+    const batchSize = parseInt(req.body.batchSize) || 10;
     const TrailerService = require('./services/TrailerService');
 
     res.status(202).json({
-      message: `Batch update started for ${limit} movies`,
+      message: `Batch update started (batchSize=${batchSize}, limit=${limit || 'default'})`,
       status: 'processing'
     });
 
     // Run in background
-    TrailerService.batchUpdateTrailers(limit)
+    TrailerService.batchUpdateTrailers({
+      batchSize,
+      limit: limit > 0 ? limit : undefined,
+    })
       .then(stats => {
         logger.info(`[API] Batch trailer update completed: ${JSON.stringify(stats)}`);
       })
