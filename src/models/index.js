@@ -63,6 +63,11 @@ const Report = require('./report');
 const Feedback = require('./feedback');
 const Notification = require('./notification');
 
+// ============================================================
+// Trailer Crawler
+// ============================================================
+const TrailerCrawlerCheckpoint = require('./trailerCrawlerCheckpoint');
+
 module.exports = {
   // User & Authentication
   User,
@@ -103,5 +108,8 @@ module.exports = {
   // System
   Report,
   Feedback,
-  Notification
+  Notification,
+
+  // Trailer Crawler
+  TrailerCrawlerCheckpoint,
 };

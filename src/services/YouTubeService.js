@@ -35,10 +35,11 @@ class YouTubeService {
 
     // maxResults nhỏ, ưu tiên 5 (yêu cầu #2)
     this.maxResults = config.youtube.maxResults ?? 5;
-    // ⭐ Mở rộng: dùng nhiều query hơn (priority-ordered) để tăng khả năng tìm thấy
-    // trailer cho phim châu Á (TQ/Hàn/Nhật) có nhiều tên gọi. Default 6, override
-    // bằng env `YOUTUBE_MAX_QUERIES`. Vẫn cap để bảo vệ quota.
-    this.maxQueries = parseInt(process.env.YOUTUBE_MAX_QUERIES || '6', 10);
+    // ⭐ HARD CAP: tối đa 3 query / movie (yêu cầu #1-#12).
+    // Mặc định 3, override bằng env `YOUTUBE_MAX_QUERIES` (chỉ nhận 2-3).
+    // Override cũ `YOUTUBE_MAX_QUERIES` được giữ để tương thích, nhưng luôn cap ≤ 3.
+    const requestedQueries = parseInt(process.env.YOUTUBE_MAX_QUERIES || '3', 10);
+    this.maxQueries = Math.min(3, Math.max(2, Number.isFinite(requestedQueries) ? requestedQueries : 3));
     // Cap retries for 429 separately — don't hammer a rate-limited API.
     this.rateLimitMaxRetries = parseInt(
       process.env.YOUTUBE_RATE_LIMIT_MAX_RETRIES || '0', 10
@@ -53,7 +54,7 @@ class YouTubeService {
       const st = rateLimiter.status();
       logger.info(
         `[YouTube] ✅ Initialised (SOLE trailer source) ` +
-        `(queries=${this.maxQueries}, maxResults=${this.maxResults}, ` +
+        `(queries=${this.maxQueries}/movie, maxResults=${this.maxResults}, ` +
         `concurrency=${st.concurrency}, cbThreshold=${rateLimiter.cb.failureThreshold}, ` +
         `cbCooldown=${Math.round(rateLimiter.cb.cooldownMs / 1000)}s)`
       );
@@ -67,34 +68,42 @@ class YouTubeService {
   }
 
   /**
-   * ⭐ Multi-language query templates (yêu cầu #4).
+   * ⭐ Query templates cho trailer search (yêu cầu #4, #5).
    *
-   * For each detected language, generate trailer queries in that language.
-   * Order is intentional: most specific (official trailer) first, then
-   * broader (just "trailer"), then teasers/PVs.
+   * QUAN TRỌNG: Mỗi language CHỈ trả về ĐÚNG 3 templates — đây là HARD CAP
+   * cho mỗi phim. Tổng số query / movie tối đa là 3 (yêu cầu #1).
    *
-   *   VI:  trailer, official trailer, teaser
-   *   EN:  official trailer, trailer, teaser
-   *   ZH:  预告, 预告片, trailer
-   *   JA:  予告, 予告編, PV, trailer
-   *   KO:  예고편, trailer
+   * Thứ tự ưu tiên (yêu cầu #2):
+   *   Query 1: "{t} official trailer"  → bản chính thức, khả năng match cao nhất
+   *   Query 2: "{t} trailer"           → fallback khi Q1 không có kết quả
+   *   Query 3: "{t} teaser"            → phim chưa có trailer, lấy teaser
    *
-   * Note: 'latin' (English) uses the same template as 'en' since English is
-   * the de-facto trailer language on YouTube.
+   * Với phim châu Á, các template được thay bằng từ khóa bản địa để YouTube
+   * trả kết quả chính xác hơn:
+   *   ZH:  "{t} 预告", "{t} 预告片", "{t} trailer"
+   *   JA:  "{t} 予告", "{t} 予告編", "{t} PV"
+   *   KO:  "{t} 예고편", "{t} trailer", "{t} 티저"
+   *
+   * @param {string} language
+   * @returns {string[]}
    */
   _getQueryTemplates(language) {
     switch (language) {
       case 'vi':
-        return ['{t} trailer', '{t} official trailer', '{t} teaser'];
+        // Phim Việt: trailer thường có "official trailer" hoặc chỉ "trailer".
+        // Teaser ít phổ biến nên để "trailer" làm Q2.
+        return ['{t} official trailer', '{t} trailer', '{t} teaser'];
       case 'zh':
         return ['{t} 预告', '{t} 预告片', '{t} trailer'];
       case 'ja':
-        return ['{t} 予告', '{t} 予告編', '{t} PV', '{t} trailer'];
+        // Nhật: trailer dùng "予告" / "予告編" / "PV".
+        return ['{t} 予告', '{t} 予告編', '{t} PV'];
       case 'ko':
-        return ['{t} 예고편', '{t} trailer'];
+        return ['{t} 예고편', '{t} trailer', '{t} 티저'];
       case 'en':
       case 'latin':
       default:
+        // Phim Latin/Anh: ưu tiên "official trailer" trước.
         return ['{t} official trailer', '{t} trailer', '{t} teaser'];
     }
   }
@@ -580,33 +589,40 @@ class YouTubeService {
   /**
    * ⭐ Build the list of search queries to try for a movie (multi-language).
    *
-   * Algorithm (yêu cầu #1-#6):
-   *   1. Normalize ALL titles (strip (Phần 1), (P2), Part 3, Season 1, Tập 5, etc.)
-   *   2. Detect language of each title (vi/en/zh/ja/ko)
-   *   3. For each title, generate queries in the matching language template:
-   *        VI:  "{t} trailer", "{t} official trailer", "{t} teaser"
-   *        EN:  "{t} official trailer", "{t} trailer", "{t} teaser"
-   *        ZH:  "{t} 预告", "{t} 预告片", "{t} trailer"
-   *        JA:  "{t} 予告", "{t} 予告編", "{t} PV", "{t} trailer"
-   *        KO:  "{t} 예고편", "{t} trailer"
-   *   4. Priority order: originalTitle > movieName > altTitles
-   *      (yêu cầu #5: prioritize original/VI title)
-   *   5. De-dup and cap at maxQueries
+   * ⭐ HARD CAP: Tối đa 3 query / movie (yêu cầu #1).
    *
-   * Note: for Asian films, BOTH the romanized title AND the native-script title
-   * are tried. e.g. "Huyền Giới Chi Môn" gets "trailer" queries AND
-   * "界门之下" gets "预告" queries.
+   * Algorithm (yêu cầu #2, #3, #4, #5):
+   *   1. Normalize ALL titles (strip (Phần 1), (P2), Part 3, Season 1, Tập 5, etc.)
+   *   2. Chọn 1 title đại diện theo thứ tự ưu tiên:
+   *        a. `originalTitle` (Movie.originName / originalTitle) — ưu tiên cao nhất
+   *        b. `movieName` (VI title) — fallback
+   *        c. Alt titles — fallback cuối
+   *   3. Phát hiện ngôn ngữ của title đại diện (vi/en/zh/ja/ko/latin)
+   *   4. Generate ĐÚNG 3 query theo template ngôn ngữ đó:
+   *        EN/VI/Latin: "official trailer" → "trailer" → "teaser"
+   *        ZH:           "预告" → "预告片" → "trailer"
+   *        JA:           "予告" → "予告編" → "PV"
+   *        KO:           "예고편" → "trailer" → "티저"
+   *   5. De-dup (case-insensitive), giữ nguyên thứ tự ưu tiên.
+   *   6. Cap ở `maxQueries` (mặc định 3).
+   *
+   * Ưu tiên `originalTitle` (yêu cầu #3):
+   *   - Phim Nhật: originalTitle="千と千尋の神隠し" → query "千と千尋の神隠し 予告" trước
+   *   - Phim Trung: originalTitle="流浪地球" → query "流浪地球 预告" trước
+   *   - Phim Hàn:  originalTitle="기생충" → query "기생충 예고편" trước
+   *
+   * KHÔNG lưu title đã normalize vào DB — chỉ dùng để search (yêu cầu #4).
    *
    * @param {string} movieName    Vietnamese title (raw)
    * @param {number|string|null} year  release year (currently unused)
    * @param {string} [originName]  original title fallback (raw)
    * @param {string|string[]} [altTitles]  alternate titles (raw)
-   * @returns {string[]}
+   * @returns {string[]}          Up to 3 query strings
    */
   _buildQueries(movieName, year, originName, altTitles) {
-    const maxQueries = Math.max(2, this.maxQueries || 6);
+    const maxQueries = Math.max(2, Math.min(3, this.maxQueries || 3));
 
-    // ⭐ Step 1: Normalize all titles.
+    // ⭐ Step 1: Normalize tất cả titles.
     const titleVi = this._normalizeTitle(movieName);
     const titleOrigin = this._normalizeTitle(originName);
     let alts = [];
@@ -630,41 +646,43 @@ class YouTubeService {
       alts = dedup;
     }
 
-    // ⭐ Step 2: Build an ordered list of (title, language) tuples.
-    // Priority: original title (originName) FIRST if it's non-Latin
-    // (i.e. it's a real "original" title, not just an English title duplicated
-    // as originName), then VI title, then alt titles.
-    //
-    // Reason: for "Giới Môn Chi Hạ" (VI) + originName "界门之下" (ZH),
-    // we want the ZH-language queries to be tried first because YouTube
-    // has more authoritative content under the original title.
-    const titleEntries = []; // [{ title, language, source }]
-
+    // ⭐ Step 2: Chọn title đại diện.
+    // Ưu tiên: originName (originalTitle) > movieName (VI) > alts[0]
+    // Reason (yêu cầu #3): originalTitle thường là tên gốc của phim châu Á
+    // → match YouTube tốt hơn nhiều so với tên Việt.
+    let chosenTitle = '';
+    let chosenSource = '';
     const seenTitles = new Set();
-    const addEntry = (t, source) => {
+    const tryAdopt = (t, source) => {
+      if (chosenTitle) return;
       if (!t) return;
-      const lang = this._detectLanguage(t);
-      if (!lang) return;
       const k = t.toLowerCase();
       if (seenTitles.has(k)) return;
+      // ⭐ Detect language — chỉ chọn title có ngôn ngữ nhận diện được
+      const lang = this._detectLanguage(t);
+      if (!lang) return;
       seenTitles.add(k);
-      titleEntries.push({ title: t, language: lang, source });
+      chosenTitle = t;
+      chosenSource = source;
     };
+    tryAdopt(titleOrigin, 'origin');
+    tryAdopt(titleVi, 'main');
+    for (const a of alts) tryAdopt(a, 'alt');
 
-    // Origin FIRST (highest priority) — usually the original-language title.
-    addEntry(titleOrigin, 'origin');
-    // Then VI title.
-    addEntry(titleVi, 'main');
-    // Then alt titles (Chinese, Japanese, Korean, English, etc.).
-    for (const a of alts) addEntry(a, 'alt');
+    if (!chosenTitle) {
+      logger.warn(
+        `[YouTube] No recognizable title for "${movieName}" — cannot build queries`
+      );
+      return [];
+    }
 
-    // ⭐ Step 3: For each title, emit queries in the matching language.
+    // ⭐ Step 3: Phát hiện ngôn ngữ + generate ĐÚNG 3 query theo template.
+    const language = this._detectLanguage(chosenTitle);
+    const templates = this._getQueryTemplates(language);
+
     const candidates = [];
-    for (const { title, language, source } of titleEntries) {
-      const templates = this._getQueryTemplates(language);
-      for (const tpl of templates) {
-        candidates.push({ query: tpl.replace('{t}', title), language, source, title });
-      }
+    for (const tpl of templates) {
+      candidates.push({ query: tpl.replace('{t}', chosenTitle), language, source: chosenSource });
     }
 
     // ⭐ Step 4: De-duplicate (case-insensitive) preserving priority order.
@@ -677,28 +695,13 @@ class YouTubeService {
       queries.push(c.query);
     }
 
-    // ⭐ Step 5: Cap at maxQueries to protect API quota.
+    // ⭐ Step 5: HARD CAP — tối đa 3 query / movie.
     const capped = queries.slice(0, maxQueries);
 
-    // ⭐ Step 6: Log the language detection + query plan (yêu cầu #10).
-    const langs = titleEntries.map((e) => `${e.source}=${e.language}(${e.title})`).join(', ');
+    // ⭐ Step 6: Log query plan (yêu cầu #12).
     logger.info(
-      `[YouTube] Multi-lang query plan for "${movieName}" → ` +
-      `${capped.length} queries [${langs}]`
+      `[Trailer] 📋 Plan: 1 title="${chosenTitle}" (${chosenSource}, lang=${language.toUpperCase()}) → ${capped.length} queries [${capped.map((q, i) => `[${i + 1}/${capped.length}] "${q}"`).join(' → ')}]`
     );
-    capped.forEach((q, i) => {
-      const lang = this._detectLanguage(
-        q.replace(/\s+(trailer|预告|预告片|予告|予告編|PV|예고편|teaser|official trailer)\s*/i, '')
-      );
-      logger.debug(`[YouTube] query[${i + 1}/${capped.length}] language=${lang.toUpperCase()} → "${q}"`);
-    });
-
-    if (queries.length > capped.length) {
-      logger.debug(
-        `[YouTube] Query list capped: ${capped.length}/${queries.length} ` +
-        `(maxQueries=${maxQueries})`
-      );
-    }
 
     return capped;
   }
@@ -807,25 +810,26 @@ class YouTubeService {
     const normalizedName = this._normalizeTitle(movieName);
     if (normalizedName && normalizedName !== movieName.trim()) {
       logger.info(
-        `[YouTube] Normalized title: "${movieName}" → "${normalizedName}"`
+        `[Trailer] Normalized: "${movieName}" → "${normalizedName}"`
       );
     }
 
     const queries = this._buildQueries(movieName, year, originName, altTitles);
-    if (queries.length === 0) return null;
+    if (queries.length === 0) {
+      logger.warn(`[Trailer] No queries built for "${movieName}"`);
+      return null;
+    }
+
+    const MAX_PER_MOVIE = queries.length; // hard cap (≤3)
 
     logger.info(
-      `[YouTube] Searching trailer: "${movieName}" (normalized="${normalizedName}") ` +
-      `(origin="${originName || '-'}", slug="${slug || '-'}", ` +
-      `altTitles=${JSON.stringify(altTitles || [])}, queries=${queries.length})`
+      `[Trailer] ▶ Start: "${movieName}" ` +
+      `(origin="${originName || '-'}", altTitles=${JSON.stringify(altTitles || []).slice(0, 100)}, max=${MAX_PER_MOVIE})`
     );
-    // In danh sách query để debug dễ (requirement #10)
-    if (queries.length > 0) {
-      logger.debug(`[YouTube] Query plan: ${queries.map((q, i) => `[${i + 1}] "${q}"`).join(' → ')}`);
-    }
 
     for (let i = 0; i < queries.length; i++) {
       const query = queries[i];
+      const searchNo = i + 1;
 
       // ⭐ BUGFIX: circuit OPEN / cooldown → THROW (không return null) để caller
       // biết đây là tạm thời → KHÔNG mark NOT_FOUND, giữ trailer field UNCHANGED
@@ -836,14 +840,14 @@ class YouTubeService {
         const isOpen = rateLimiter.isCircuitOpen();
         const remainingMs = rateLimiter.readyInMs();
         logger.warn(
-          `[YouTube] ⛔ Unavailable (${isOpen ? 'CIRCUIT_OPEN' : 'COOLDOWN'}) — ` +
-          `stopping at query ${i + 1}/${queries.length} for "${movieName}" ` +
+          `[Trailer] ⛔ RATE_LIMITED for "${movieName}" — ` +
+          `${isOpen ? 'CIRCUIT_OPEN' : 'COOLDOWN'} at search ${searchNo}/${MAX_PER_MOVIE} ` +
           `(~${Math.round(remainingMs / 1000)}s remaining). ` +
-          `THROWING RATE_LIMITED — caller will NOT mark as NOT_FOUND.`
+          `Stopping — DB trailer field UNCHANGED, will be retried.`
         );
         const e = new Error(
-          `[YouTube] ${isOpen ? 'CIRCUIT_OPEN' : 'RATE_LIMITED'} ` +
-          `for "${movieName}" (query ${i + 1}/${queries.length})`
+          `[Trailer] ${isOpen ? 'CIRCUIT_OPEN' : 'RATE_LIMITED'} ` +
+          `for "${movieName}" (search ${searchNo}/${MAX_PER_MOVIE})`
         );
         e.code = isOpen ? 'CIRCUIT_OPEN' : 'RATE_LIMITED';
         e.retryAfterMs = remainingMs;
@@ -851,15 +855,9 @@ class YouTubeService {
       }
 
       try {
-        // ⭐ yêu cầu #10: log rõ language + query.
-        const queryLang = this._detectLanguage(
-          query.replace(
-            /\s+(trailer|预告|预告片|予告|予告編|PV|예고편|teaser|official trailer)\s*$/iu,
-            ''
-          )
-        );
+        // ⭐ yêu cầu #12: log "[Trailer] Search 1/3" trước khi gọi API.
         logger.info(
-          `[YouTube] 🔎 Query ${i + 1}/${queries.length} language=${queryLang.toUpperCase()}: "${query}" for "${movieName}"`
+          `[Trailer] Search ${searchNo}/${MAX_PER_MOVIE}: "${query}" for "${movieName}"`
         );
 
         const response = await this._executeWithRetry(
@@ -879,17 +877,17 @@ class YouTubeService {
         const items = response.data?.items || [];
         if (items.length === 0) {
           logger.info(
-            `[YouTube]   ↳ 0 results for "${query}" — trying next query`
+            `[Trailer] Search ${searchNo}/${MAX_PER_MOVIE}: 0 results for "${query}" — try next`
           );
           continue;
         }
 
         // Log raw count + filtered count (requirement #10)
-        const filtered = items.filter(item => this._isPlausibleVideo(item, movieName, altTitles));
+        const filtered = items.filter(item => this._isPlausibleVideo(item, movieName, originName, altTitles));
         if (filtered.length === 0) {
           logger.info(
-            `[YouTube]   ↳ ${items.length} raw results, 0 plausible (no trailer/teaser keyword match) ` +
-            `for "${query}" — trying next query`
+            `[Trailer] Search ${searchNo}/${MAX_PER_MOVIE}: ${items.length} raw, 0 plausible ` +
+            `for "${query}" — try next`
           );
           continue;
         }
@@ -897,7 +895,7 @@ class YouTubeService {
         const best = this._findBestTrailer(filtered, movieName, originName, altTitles);
         if (!best) {
           logger.info(
-            `[YouTube]   ↳ ${items.length} raw / ${filtered.length} filtered, no winner — trying next query`
+            `[Trailer] Search ${searchNo}/${MAX_PER_MOVIE}: ${items.length} raw / ${filtered.length} filtered, no winner — try next`
           );
           continue;
         }
@@ -916,52 +914,61 @@ class YouTubeService {
           viewCount: 0
         };
 
+        // ⭐ yêu cầu #6, #12: log "FOUND" và return NGAY (early-exit cứng),
+        // không chạy query 2/3. Đỡ tốn quota cho query còn lại.
         logger.info(
-          `[YouTube] ✅ FOUND ${trailerType}: "${trailer.name}" (key=${trailer.key}) ` +
-          `for "${movieName}" via query [${i + 1}] "${query}"`
+          `[Trailer] ✅ FOUND (search ${searchNo}/${MAX_PER_MOVIE}): ${trailerType} ` +
+          `"${trailer.name}" (key=${trailer.key}) for "${movieName}" via "${query}"` +
+          (trailer.official && trailerType === 'Trailer'
+            ? ` — early-exit (official trailer, high-confidence)`
+            : '')
         );
-
-        // ⭐ yêu cầu #6: early-exit khi tìm được "official trailer" với high
-        // confidence. Đỡ tốn quota cho các query còn lại.
-        if (trailer.official && trailerType === 'Trailer') {
-          logger.info(
-            `[YouTube] 🚀 High-confidence trailer (official=true, type=Trailer) — ` +
-            `early-exit, skipping remaining ${queries.length - i - 1} queries.`
-          );
-        }
         return trailer;
       } catch (err) {
         // ⭐ BUGFIX (yêu cầu #1, #5): stop trying more queries on
-        // quota/rate-limit/circuit-open/timeout. Re-throw so the caller
+        // quota/rate-limit/circuit-open. Re-throw so the caller
         // marks movie as RATE_LIMITED (NOT NOT_FOUND) and retries later.
-        if (
-          err.code === 'RATE_LIMITED' ||
-          err.code === 'QUOTA_EXCEEDED' ||
-          err.code === 'CIRCUIT_OPEN'
-        ) {
+        if (err.code === 'QUOTA_EXCEEDED') {
           logger.warn(
-            `[YouTube] ⛔ ${err.code} — STOPPING further queries for "${movieName}" ` +
-            `(after ${i + 1}/${queries.length}). Retry suggested in ~${Math.round((err.retryAfterMs || 0) / 1000)}s.`
+            `[Trailer] ⛔ QUOTA_EXCEEDED at search ${searchNo}/${MAX_PER_MOVIE} for "${movieName}" ` +
+            `(after ${searchNo}/${MAX_PER_MOVIE}). Quota resets ~${new Date(Date.now() + (err.retryAfterMs || 0)).toISOString()}. ` +
+            `STOPPING — DB trailer field UNCHANGED, will be retried after quota reset.`
+          );
+          throw err;
+        }
+        if (err.code === 'RATE_LIMITED' || err.code === 'CIRCUIT_OPEN') {
+          logger.warn(
+            `[Trailer] ⏸ RATE_LIMITED at search ${searchNo}/${MAX_PER_MOVIE} for "${movieName}" ` +
+            `(after ${searchNo}/${MAX_PER_MOVIE}). Retry in ~${Math.round((err.retryAfterMs || 0) / 1000)}s. ` +
+            `STOPPING — DB trailer field UNCHANGED, will be retried.`
           );
           throw err;
         }
         if (err.code === 'TIMEOUT') {
-          logger.warn(`[YouTube] ⏱ Timeout for "${query}" — trying next`);
+          // Timeout cho 1 query riêng — thử query kế tiếp (yêu cầu #13: không retry cùng query).
+          logger.warn(
+            `[Trailer] ⏱ TIMEOUT at search ${searchNo}/${MAX_PER_MOVIE} for "${query}" — try next`
+          );
           continue;
         }
         if (err.code === 'API_ERROR') {
-          // 4xx/5xx → log and continue to next query (unless it's a transient 5xx, already retried)
-          logger.warn(`[YouTube] ${err.status || err.code} for "${query}": ${err.message}`);
+          // 4xx/5xx → log và continue sang query tiếp theo
+          logger.warn(
+            `[Trailer] ${err.status || err.code} at search ${searchNo}/${MAX_PER_MOVIE} for "${query}": ${err.message} — try next`
+          );
           continue;
         }
-        logger.warn(`[YouTube] Unexpected error for "${query}": ${err.message}`);
+        logger.warn(
+          `[Trailer] Unexpected error at search ${searchNo}/${MAX_PER_MOVIE} for "${query}": ${err.message} — try next`
+        );
         continue;
       }
     }
 
+    // ⭐ yêu cầu #12: log NOT_FOUND sau khi đã chạy tối đa 3 query và KHÔNG có lỗi quota.
     logger.info(
-      `[YouTube] ⬜ NOT FOUND — no trailer after ${queries.length} queries for "${movieName}" ` +
-      `(queries exhausted, not a rate-limit issue). Will mark movie as NOT_FOUND.`
+      `[Trailer] ⬜ NOT_FOUND for "${movieName}" — ran ${MAX_PER_MOVIE}/${MAX_PER_MOVIE} queries, ` +
+      `YouTube healthy, no trailer found.`
     );
     return null;
   }
@@ -986,19 +993,27 @@ class YouTubeService {
 
   /**
    * ⭐ Lọc kết quả (yêu cầu #3 + #7 + #10): chỉ giữ video có title chứa MỘT trong:
-   *   'official trailer' | 'trailer' | 'official teaser' | 'teaser' | '预告'
+   *   Latin/English: 'official trailer' | 'trailer' | 'official teaser' | 'teaser'
+   *   Chinese:       '预告' | '预告片' | 'trailer'
+   *   Japanese:      '予告' | '予告編' | 'PV' | 'trailer'
+   *   Korean:        '예고편' | '티저' | 'trailer'
    * (khớp không phân biệt hoa thường). Đồng thời loại rác (VEVO, lyric, OST, Shorts).
    *
-   * Match logic: token phải trùng với MỘT trong các tên: `movieName` hoặc bất
-   * kỳ tên nào trong `altTitles`. Nếu phim chỉ có 1 tên thì chỉ cần 1 token
+   * Match logic: token phải trùng với MỘT trong các tên: `movieName`, `originName`
+   * HOẶC bất kỳ tên nào trong `altTitles`. Nếu phim chỉ có 1 tên thì chỉ cần 1 token
    * trùng; nếu có nhiều tên thì cho phép token trùng với bất kỳ tên nào.
+   *
+   * ⭐ Lưu ý: với phim Nhật/Trung/Hàn, `movieName` thường là tiếng Việt, không
+   * trùng với title YouTube. PHẢI dùng `originName` (hoặc altTitles chứa tên gốc)
+   * để so khớp token. Nếu chỉ dùng movieName VI thì sẽ miss hết.
    *
    * @param {Object} item
    * @param {string} movieName
+   * @param {string} [originName]   QUAN TRỌNG: original title (cho phim châu Á)
    * @param {string[]} [altTitles]  alternate titles (CJK/English)
    * @returns {boolean}
    */
-  _isPlausibleVideo(item, movieName, altTitles) {
+  _isPlausibleVideo(item, movieName, originName, altTitles) {
     const title = (item.snippet?.title || '').toLowerCase();
     const channel = (item.snippet?.channelTitle || '').toLowerCase();
 
@@ -1017,16 +1032,29 @@ class YouTubeService {
     if (/\bshorts?\b/i.test(title) && !/\btrailer\b/i.test(title)) return false;
 
     // ── BẮT BUỘC có từ khóa trailer/teaser (yêu cầu #3) ──
+    // ⭐ Multi-language: bao gồm CJK keywords cho phim châu Á.
     const hasKeyword =
+      // Latin/English
       title.includes('official trailer') ||
       title.includes('trailer') ||
       title.includes('official teaser') ||
       title.includes('teaser') ||
-      title.includes('预告'); // ⭐ Chinese: cho phép title CJK thuần
+      // Chinese (Giản thể & Phồn thể)
+      title.includes('预告') ||
+      title.includes('預告') ||
+      // Japanese
+      title.includes('予告') ||
+      title.includes('pv') ||  // case-insensitive: 'PV', 'pv'
+      title.includes('ティザー') ||  // teaser JA
+      // Korean
+      title.includes('예고편') ||
+      title.includes('티저');
     if (!hasKeyword) return false;
 
-    // ── Tên phải khớp ít nhất 1 token trong (movieName ∪ altTitles) ──
-    const titleBag = [movieName];
+    // ── Tên phải khớp ít nhất 1 token trong (movieName ∪ originName ∪ altTitles) ──
+    // ⭐ FIX: thêm originName vào titleBag để phim Nhật/Trung/Hàn có token
+    // khớp với title YouTube (vốn là tiếng gốc chứ không phải tiếng Việt).
+    const titleBag = [movieName, originName];
     if (Array.isArray(altTitles)) titleBag.push(...altTitles);
 
     let anyTokens = [];
@@ -1040,12 +1068,27 @@ class YouTubeService {
     return true;
   }
 
+  /**
+   * ⭐ Lấy các token đáng kể từ text để so khớp với title YouTube.
+   *
+   * QUAN TRỌNG (yêu cầu mới):
+   *   - Latin/English: chỉ giữ token length >= 3 ("the", "a", "of" bị loại)
+   *   - CJK (Chinese/Japanese/Korean): GIỮ TẤT CẢ ký tự, kể cả 1-2 ký tự
+   *     (vì "葉問" (2 ký tự), "千尋" (2 ký tự) là tên phim hợp lệ)
+   *
+   * @param {string} text
+   * @returns {string[]}
+   */
   _significantTokens(text) {
     if (!text) return [];
-    return String(text)
-      .toLowerCase()
-      .split(/\s+/)
-      .filter((t) => t.length >= 3);
+    const s = String(text).toLowerCase();
+    // ⭐ Nếu text CJK, trả về TOÀN BỘ text làm 1 token
+    if (/[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]/.test(s)) {
+      const trimmed = s.trim();
+      return trimmed ? [trimmed] : [];
+    }
+    // Latin: split + filter length >= 3
+    return s.split(/\s+/).filter((t) => t.length >= 3);
   }
 
   /**
@@ -1083,8 +1126,18 @@ class YouTubeService {
       const title = (item.snippet?.title || '').toLowerCase();
       const channel = (item.snippet?.channelTitle || '').toLowerCase();
 
-      const isTrailer = title.includes('trailer') || title.includes('预告');
-      const isTeaser = title.includes('teaser');
+      // ⭐ Multi-language trailer keyword: Latin (trailer), CJK (预告/予告/예고편/PV/티저/ティザー).
+      const isTrailer =
+        title.includes('trailer') ||
+        title.includes('预告') ||
+        title.includes('預告') ||
+        title.includes('予告') ||
+        title.includes('pv') ||
+        title.includes('예고편');
+      const isTeaser =
+        title.includes('teaser') ||
+        title.includes('ティザー') ||
+        title.includes('티저');
       const isOfficial = this._isOfficialTrailer(title, channel);
 
       // ── RANK theo yêu cầu #7 (0 = tốt nhất) ──
@@ -1110,6 +1163,15 @@ class YouTubeService {
       if (title.includes('clip') && !isTrailer && !isTeaser) score -= 5;
       // Penalty cho Shorts còn sót (yêu cầu #7)
       if (title.includes('#shorts') || title.includes('#short')) score -= 20;
+      // ⭐ Penalty cho "Fan Made" / "fan edit" / "concept" / "amv" — chọn official channel trước
+      if (
+        title.includes('fan made') ||
+        title.includes('fan-made') ||
+        title.includes('fan edit') ||
+        title.includes('concept') ||
+        title.includes('amv') ||
+        title.includes('mashup')
+      ) score -= 15;
 
       // Ưu tiên video mới hơn (giảm nhẹ)
       const publishedRaw = item.snippet?.publishedAt;

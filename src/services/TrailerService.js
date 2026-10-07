@@ -16,6 +16,7 @@
 const YouTubeService = require('./YouTubeService');
 const rateLimiter = require('../utils/youtubeRateLimiter');
 const trailerState = require('../utils/trailerState');
+const trailerCheckpoint = require('../utils/trailerCheckpoint');
 const { Movie } = require('../models');
 const config = require('../config');
 const logger = require('../utils/logger');
@@ -137,13 +138,29 @@ class TrailerService {
       // This is the ONLY path that can produce NOT_FOUND.
       logger.info(
         `[Trailer] ⬜ NOT_FOUND for "${movie.name}" — YouTube healthy, ` +
-        `all queries exhausted, no trailer. Will mark movie as NOT_FOUND.`
+        `max queries exhausted, no trailer. Will mark movie as NOT_FOUND.`
       );
       return { trailer: null, status: 'NOT_FOUND', retryAt: null, error: null, source: null };
     } catch (err) {
       // ⭐ BUGFIX: RATE_LIMITED / CIRCUIT_OPEN / QUOTA_EXCEEDED must NEVER be
       // treated as NOT_FOUND. These are transient, trailer stays untouched.
-      if (err.code === 'RATE_LIMITED' || err.code === 'CIRCUIT_OPEN' || err.code === 'QUOTA_EXCEEDED') {
+      if (err.code === 'QUOTA_EXCEEDED') {
+        const retryAfterMs = err.retryAfterMs || DEFAULT_RETRY_AFTER_MS;
+        logger.warn(
+          `[Trailer] ⛔ QUOTA_EXCEEDED for "${movie.name}" — YouTube quota hết, ` +
+          `retry at ~${new Date(Date.now() + retryAfterMs).toISOString()}. ` +
+          `DB trailer field UNCHANGED (sẽ retry sau khi quota reset).`
+        );
+        return {
+          trailer: null,
+          status: 'RATE_LIMITED',
+          code: 'QUOTA_EXCEEDED',
+          retryAt: new Date(Date.now() + retryAfterMs),
+          error: err,
+          source: null,
+        };
+      }
+      if (err.code === 'RATE_LIMITED' || err.code === 'CIRCUIT_OPEN') {
         const retryAfterMs = err.retryAfterMs || DEFAULT_RETRY_AFTER_MS;
         logger.warn(
           `[Trailer] ⏸ RATE_LIMITED for "${movie.name}" — YouTube ` +
@@ -358,6 +375,9 @@ class TrailerService {
     // -----------------------------------------------------------------
     // ⭐ YouTube RATE_LIMITED / TIMEOUT / CIRCUIT_OPEN / QUOTA_EXCEEDED =>
     //   trailer stays UNTOUCHED in DB, retryAt set, NO TMDB call.
+    //   - QUOTA_EXCEEDED: cooldown đến 00:00 PT (YouTube reset quota).
+    //   - RATE_LIMITED/CIRCUIT_OPEN: cooldown theo Retry-After hoặc circuit breaker.
+    //   - TIMEOUT: retry sau DEFAULT_RETRY_AFTER_MS.
     //   This includes the 'search()' pre-check (when circuit is open at start)
     //   and the throw path (when YouTube returns 429 mid-query).
     // -----------------------------------------------------------------
@@ -366,11 +386,21 @@ class TrailerService {
         youtube.retryAt || new Date(Date.now() + DEFAULT_RETRY_AFTER_MS);
       await this.markRateLimited(movie._id, retryAt, youtube.code);
       trailerState.setCooldown(key, retryAt, youtube.code || 'YOUTUBE_RATE_LIMITED');
-      logger.warn(
-        `[Trailer] ⏸ RETRY_PENDING for "${movie.name}" — code=${youtube.code || 'RATE_LIMITED'}, ` +
-        `retry at ${retryAt.toISOString()}. ` +
-        `trailer field UNCHANGED in DB.`
-      );
+
+      // Log cụ thể theo code để dễ debug (yêu cầu #12).
+      const codeLabel = youtube.code || 'RATE_LIMITED';
+      if (codeLabel === 'QUOTA_EXCEEDED') {
+        logger.warn(
+          `[Trailer] ⛔ QUOTA_EXCEEDED for "${movie.name}" — quota reset at ${retryAt.toISOString()}. ` +
+          `DB trailer field UNCHANGED. Stopping batch until quota reset.`
+        );
+      } else {
+        logger.warn(
+          `[Trailer] ⏸ RETRY_PENDING for "${movie.name}" — code=${codeLabel}, ` +
+          `retry at ${retryAt.toISOString()}. ` +
+          `DB trailer field UNCHANGED in DB.`
+        );
+      }
       return {
         trailer: null,
         status: 'RATE_LIMITED',
@@ -406,7 +436,7 @@ class TrailerService {
     trailerState.clearCooldown(key);
     logger.info(
       `[Trailer] ⬜ NOT_FOUND for "${movie.name}" — YouTube healthy, ` +
-      `all queries exhausted, no trailer on YouTube. ` +
+      `max queries exhausted, no trailer on YouTube. ` +
       `Marked trailerJobStatus='NOT_FOUND' (will NOT be retried).`
     );
     return { trailer: null, status: 'NOT_FOUND', saved: false, retryAt: null, source: null };
@@ -627,7 +657,8 @@ class TrailerService {
     // Load defaults from config
     const cfg = config.trailerBatch || {};
 
-    // Validate batchSize: only {10, 20, 30, 40} allowed; else fallback to 10.
+    // ⭐ Yêu cầu #1, #11: max 3 search / movie (chỉ nhận 2-3).
+    // Batch size chỉ nhận {10, 20, 30, 40}.
     const rawBatchSize = Number.isFinite(opts.batchSize) ? opts.batchSize : cfg.batchSize;
     const batchSize = ALLOWED_BATCH_SIZES.includes(rawBatchSize) ? rawBatchSize : 10;
     if (!ALLOWED_BATCH_SIZES.includes(rawBatchSize)) {
@@ -637,15 +668,26 @@ class TrailerService {
       );
     }
 
+    // ⭐ Yêu cầu #1: MAX_SEARCH_PER_MOVIE=3 (hard cap từ config hoặc env).
+    const maxSearchPerMovie = Math.min(
+      3,
+      Math.max(2, Number.isFinite(opts.maxSearchPerMovie) ? opts.maxSearchPerMovie : (cfg.maxSearchPerMovie ?? 3))
+    );
+    // Push xuống YouTubeService để áp dụng cho tất cả query plan của batch này.
+    if (Number.isFinite(opts.maxSearchPerMovie) || cfg.maxSearchPerMovie) {
+      YouTubeService.maxQueries = maxSearchPerMovie;
+    }
+
     const batchPauseMs = Number.isFinite(opts.batchPauseMs)
       ? opts.batchPauseMs
       : (cfg.batchPauseMs ?? 60_000);
+    // ⭐ Yêu cầu #11: DELAY_BETWEEN_MOVIES=5-10s
     const movieDelayMinMs = Number.isFinite(opts.movieDelayMinMs)
       ? opts.movieDelayMinMs
-      : (cfg.movieDelayMinMs ?? 3_000);
+      : (cfg.movieDelayMinMs ?? 5_000);
     const movieDelayMaxMs = Number.isFinite(opts.movieDelayMaxMs)
       ? opts.movieDelayMaxMs
-      : (cfg.movieDelayMaxMs ?? 8_000);
+      : (cfg.movieDelayMaxMs ?? 10_000);
     const rateLimitCooldownMs = Number.isFinite(opts.rateLimitCooldownMs)
       ? opts.rateLimitCooldownMs
       : (cfg.rateLimitCooldownMs ?? 30 * 60_000);
@@ -653,11 +695,19 @@ class TrailerService {
       ? opts.limit
       : (cfg.maxMoviesPerRun ?? 200);
 
+    // ⭐ Yêu cầu #1, #5: CHECKPOINT với jobId
+    // - Mặc định 'default' nếu không truyền (backward-compat)
+    // - Mỗi jobId có checkpoint riêng, cho phép chạy song song nếu cần
+    const jobId = opts.jobId || 'default';
+    const forceRestart = !!opts.forceRestart;
+    const resume = opts.resume !== false; // default true
+
     logger.info(
-      `[Trailer] 🚀 Starting SEQUENTIAL batch trailer job ` +
-      `(batchSize=${batchSize}, batchPauseMs=${batchPauseMs}, ` +
+      `[Crawler] ▶ START jobId=${jobId} ` +
+      `(maxSearchPerMovie=${maxSearchPerMovie}, batchSize=${batchSize}, batchPauseMs=${batchPauseMs}, ` +
       `movieDelay=${movieDelayMinMs}-${movieDelayMaxMs}ms, ` +
-      `rateLimitCooldownMs=${rateLimitCooldownMs}, maxMovies=${maxMovies})`
+      `rateLimitCooldownMs=${rateLimitCooldownMs}, maxMovies=${maxMovies}, ` +
+      `forceRestart=${forceRestart}, resume=${resume})`
     );
 
     // Prune stale state to avoid memory leaks.
@@ -667,7 +717,7 @@ class TrailerService {
     if (rateLimiter.isCircuitOpen()) {
       const remaining = Math.round(this._circuitRemainingMs() / 1000);
       logger.warn(
-        `[Trailer] YouTube circuit OPEN - batch deferred ` +
+        `[Crawler] YouTube circuit OPEN - batch deferred ` +
         `(~${remaining}s remaining).`
       );
       return {
@@ -675,6 +725,8 @@ class TrailerService {
         errors: 0, skipped: 0, cooldowns: 0,
         batches: 0, batchesPlanned: 0,
         deferred: true,
+        jobId,
+        status: 'DEFERRED',
       };
     }
 
@@ -721,34 +773,107 @@ class TrailerService {
     }
 
     if (pool.length === 0) {
-      logger.info(`[Trailer] ✅ Nothing to do: 0 candidates (all have valid trailers or are NOT_FOUND).`);
+      logger.info(`[Crawler] ✅ Nothing to do: 0 candidates (all have valid trailers or are NOT_FOUND).`);
       return {
         total: 0, found: 0, rateLimited: 0, notFound: 0,
         errors: 0, skipped: 0, cooldowns: 0,
         batches: 0, batchesPlanned: 0,
         candidatesInDb: candidateCount,
+        jobId,
+        status: 'COMPLETED',
+        currentIndex: 0,
       };
+    }
+
+    // ⭐ Yêu cầu #5: LOAD CHECKPOINT (resume từ vị trí đã dừng)
+    let cp = null;
+    let resumeFromIndex = 0;
+
+    if (resume && !forceRestart) {
+      cp = await trailerCheckpoint.start(jobId, {
+        totalMovies: pool.length,
+        batchSize,
+        maxMovies,
+        forceRestart: false,
+      });
+    } else {
+      // forceRestart: tạo checkpoint mới
+      cp = await trailerCheckpoint.start(jobId, {
+        totalMovies: pool.length,
+        batchSize,
+        maxMovies,
+        forceRestart: true,
+      });
+    }
+
+    // ⭐ Yêu cầu #5: resume từ currentIndex/currentMovieId đã lưu
+    if (cp && cp.currentIndex > 0 && cp.currentIndex < pool.length) {
+      // Verify currentMovieId có trong pool không (tránh stale)
+      const cpMovieId = String(cp.currentMovieId || '');
+      const idxInPool = pool.findIndex((m) => String(m._id) === cpMovieId);
+      if (idxInPool >= 0) {
+        resumeFromIndex = idxInPool; // thử lại đúng movie bị quota
+        logger.info(
+          `[Crawler] Resume from index ${resumeFromIndex}/${pool.length} ` +
+          `(movie: ${pool[idxInPool].name}, status was: ${cp.status})`
+        );
+      } else {
+        // Không tìm thấy movie trong pool → dùng currentIndex trực tiếp
+        resumeFromIndex = Math.min(cp.currentIndex, pool.length);
+        logger.warn(
+          `[Crawler] Resume from index ${resumeFromIndex}/${pool.length} ` +
+          `(checkpoint's currentMovieId not in current pool — có thể đã có trailer từ batch khác)`
+        );
+      }
+    } else {
+      resumeFromIndex = 0;
+      logger.info(
+        `[Crawler] Starting fresh from index 0/${pool.length} ` +
+        `(no resumable checkpoint or pool mismatch)`
+      );
     }
 
     const totalBatches = Math.ceil(pool.length / batchSize);
     logger.info(
-      `[Trailer] 📦 Pool: ${pool.length} movies (candidates in DB: ${candidateCount}, ` +
-      `maxMovies cap: ${effectiveLimit}). Planned batches: ${totalBatches}.`
+      `[Crawler] 📦 Pool: ${pool.length} movies (candidates in DB: ${candidateCount}, ` +
+      `maxMovies cap: ${effectiveLimit}). Planned batches: ${totalBatches}. ` +
+      `Resume from index=${resumeFromIndex}.`
     );
 
     let found = 0, rateLimited = 0, notFound = 0, errors = 0, skipped = 0, cooldowns = 0;
+    // ⭐ Yêu cầu #8: QUOTA_EXCEEDED → dừng toàn bộ worker ngay
+    let quotaExceededAbort = false;
+    let quotaResetAt = null;
 
     // -------------------------------------------------------------------------
     // MAIN LOOP: walk through batches, then movies inside each batch, SEQUENTIALLY.
     // -------------------------------------------------------------------------
-    for (let b = 0; b < totalBatches; b++) {
+    outer: for (let b = 0; b < totalBatches; b++) {
+      // ⭐ Yêu cầu #8: nếu đã gặp QUOTA_EXCEEDED ở batch trước → dừng hẳn.
+      if (quotaExceededAbort) {
+        logger.warn(
+          `[Crawler] 🛑 QUOTA_EXCEEDED detected — stopping remaining batches ` +
+          `(chờ quota reset at ${quotaResetAt ? new Date(quotaResetAt).toISOString() : 'unknown'}).`
+        );
+        break outer;
+      }
+
       const batchStart = b * batchSize;
       const batchEnd = Math.min(batchStart + batchSize, pool.length);
       const batch = pool.slice(batchStart, batchEnd);
       const batchNo = b + 1;
 
+      // ⭐ Bỏ qua batch đã hoàn thành trước đó (resume)
+      if (batchStart + batch.length <= resumeFromIndex) {
+        logger.info(
+          `[Crawler] 📦 Batch ${batchNo}/${totalBatches} SKIP (đã xử lý trước đó, ` +
+          `resumeFrom=${resumeFromIndex}, batchEnd=${batchEnd})`
+        );
+        continue;
+      }
+
       logger.info(
-        `[Trailer] 📦 Batch ${batchNo}/${totalBatches} START ` +
+        `[Crawler] 📦 Batch ${batchNo}/${totalBatches} START ` +
         `(movies ${batchStart + 1}..${batchEnd}/${pool.length})`
       );
 
@@ -757,18 +882,35 @@ class TrailerService {
       for (let i = 0; i < batch.length; i++) {
         const m = batch[i];
         const idxInBatch = i + 1;
-        const idxOverall = batchStart + i + 1;
-        const remaining = pool.length - idxOverall;
+        const idxOverall = batchStart + i; // 0-based
+        const remaining = pool.length - idxOverall - 1;
 
-        // Per-movie banner log (requirement #9)
+        // ⭐ Yêu cầu #5: bỏ qua movie đã xử lý trước đó (resume)
+        if (idxOverall < resumeFromIndex) {
+          logger.info(
+            `[Crawler] ⏭ [Batch ${batchNo}/${totalBatches}] ` +
+            `Movie ${idxInBatch}/${batch.length} (overall ${idxOverall + 1}/${pool.length}) ` +
+            `"${m.name}" — skip (already processed in previous run)`
+          );
+          continue;
+        }
+
+        // Per-movie banner log
         logger.info(
-          `[Trailer] 🎬 [Batch ${batchNo}/${totalBatches}] ` +
-          `Movie ${idxInBatch}/${batch.length} (overall ${idxOverall}/${pool.length}) ` +
-          `→ "${m.name}" | Remaining: ${remaining}`
+          `[Crawler] Processing ${idxOverall + 1}/${pool.length}: "${m.name}" ` +
+          `(batch ${batchNo}/${totalBatches}, idxInBatch=${idxInBatch}/${batch.length})`
         );
 
-        // Defensive: skip movies that already have a valid trailer
-        // (could have been populated between query time and now).
+        // ⭐ Yêu cầu #2: persist checkpoint TRƯỚC khi xử lý movie
+        try {
+          await trailerCheckpoint.beforeMovie(jobId, m, idxOverall);
+        } catch (cpErr) {
+          logger.warn(
+            `[Crawler] Failed to update checkpoint before movie: ${cpErr.message}`
+          );
+        }
+
+        // ⭐ Yêu cầu #6: nếu movie hiện tại đã có trailer hợp lệ → skip
         if (
           m.trailer &&
           ((m.trailer.key && String(m.trailer.key).trim() !== '') ||
@@ -776,9 +918,11 @@ class TrailerService {
         ) {
           skipped++;
           logger.info(
-            `[Trailer] ⏭ [Batch ${batchNo}/${totalBatches}] ` +
-            `"${m.name}" — already has valid trailer, skipping.`
+            `[Crawler] ⏭ [Batch ${batchNo}/${totalBatches}] ` +
+            `${idxInBatch}/${batch.length} — "${m.name}" — already has valid trailer, skipping.`
           );
+          // ⭐ Yêu cầu #2: update lastProcessed sau khi skip
+          await trailerCheckpoint.afterMovie(jobId, m, idxOverall, 'SKIPPED').catch(() => {});
           continue;
         }
 
@@ -790,9 +934,10 @@ class TrailerService {
         ) {
           skipped++;
           logger.info(
-            `[Trailer] ⏭ [Batch ${batchNo}/${totalBatches}] ` +
-            `"${m.name}" — retry scheduled at ${new Date(m.trailerRetryAt).toISOString()}, skipping.`
+            `[Crawler] ⏭ [Batch ${batchNo}/${totalBatches}] ` +
+            `${idxInBatch}/${batch.length} — "${m.name}" — retry scheduled at ${new Date(m.trailerRetryAt).toISOString()}, skipping.`
           );
+          await trailerCheckpoint.afterMovie(jobId, m, idxOverall, 'SKIPPED').catch(() => {});
           continue;
         }
 
@@ -802,18 +947,55 @@ class TrailerService {
           if (result.status === 'FOUND') {
             found++;
             logger.info(
-              `[Trailer] ✅ [Batch ${batchNo}/${totalBatches}] ` +
+              `[Crawler] ✅ [Batch ${batchNo}/${totalBatches}] ` +
               `${idxInBatch}/${batch.length} — "${m.name}" FOUND ` +
               `(key=${result.trailer?.key || '-'}, source=${result.source || '-'}) | ` +
               `Remaining: ${remaining}`
             );
+            // ⭐ Yêu cầu #3: cập nhật checkpoint lastProcessed
+            await trailerCheckpoint.afterMovie(jobId, m, idxOverall, 'FOUND').catch(() => {});
           } else if (result.status === 'RATE_LIMITED') {
             rateLimited++;
+            const isQuotaExceeded = result.code === 'QUOTA_EXCEEDED';
             batchAborted = true;
+
+            if (isQuotaExceeded) {
+              // ⭐ Yêu cầu #4, #8, #14: QUOTA_EXCEEDED → DỪNG worker, lưu checkpoint
+              // CHÍNH XÁC tại movie hiện tại (KHÔNG +1). Lần sau sẽ thử lại movie này.
+              quotaResetAt = result.retryAt;
+              const resetAt = quotaResetAt ? new Date(quotaResetAt).toISOString() : 'unknown';
+
+              logger.error(
+                `[Crawler] ⛔ QUOTA_EXCEEDED at movie ${idxOverall + 1}/${pool.length}: "${m.name}"`
+              );
+              logger.error(
+                `[Crawler] Saving checkpoint: index=${idxOverall}, ` +
+                `currentMovieId=${m._id}, quotaResetAt=${resetAt}`
+              );
+              logger.error(
+                `[Crawler] ⏸ Crawler stopped. ` +
+                `${remaining} movies chưa xử lý sẽ retry sau khi quota reset.`
+              );
+              logger.error(
+                `[Crawler] Resume from index=${idxOverall} next run (currentMovieId=${m._id})`
+              );
+
+              try {
+                await trailerCheckpoint.quotaExceeded(jobId, m, idxOverall, quotaResetAt);
+              } catch (cpErr) {
+                logger.error(`[Crawler] Failed to save QUOTA_EXCEEDED checkpoint: ${cpErr.message}`);
+              }
+
+              quotaExceededAbort = true;
+              // Exit inner loop ngay — KHÔNG xử lý movie tiếp theo
+              break;
+            }
+
+            // RATE_LIMITED thường → cooldown rồi resume
             const cdSec = Math.round(rateLimitCooldownMs / 1000);
             const untilIso = new Date(Date.now() + rateLimitCooldownMs).toISOString();
             logger.warn(
-              `[Trailer] ⏸ [Batch ${batchNo}/${totalBatches}] ` +
+              `[Crawler] ⏸ [Batch ${batchNo}/${totalBatches}] ` +
               `${idxInBatch}/${batch.length} — "${m.name}" RATE_LIMITED (code=${result.code || 'COOLDOWN'}). ` +
               `STOPPING BATCH → COOLDOWN for ${cdSec}s (until ${untilIso}). ` +
               `Movie queued for RETRY (DB trailerJobStatus='RATE_LIMITED'). ` +
@@ -825,33 +1007,38 @@ class TrailerService {
               () => rateLimiter.isReady() && !rateLimiter.isCircuitOpen(),
               (leftMs) => {
                 logger.info(
-                  `[Trailer] 💤 COOLDOWN — ${Math.round(leftMs / 1000)}s remaining ` +
+                  `[Crawler] 💤 COOLDOWN — ${Math.round(leftMs / 1000)}s remaining ` +
                   `(circuit=${rateLimiter.cb?.state || 'unknown'})`
                 );
               }
             );
             cooldowns++;
+            // ⭐ Update lastProcessed (RATE_LIMITED cũng là "xử lý xong" state này)
+            await trailerCheckpoint.afterMovie(jobId, m, idxOverall, 'SKIPPED').catch(() => {});
             break; // break the inner loop; outer loop will continue with next batch
           } else if (result.status === 'NOT_FOUND') {
             notFound++;
             logger.info(
-              `[Trailer] ⬜ [Batch ${batchNo}/${totalBatches}] ` +
+              `[Crawler] ⬜ [Batch ${batchNo}/${totalBatches}] ` +
               `${idxInBatch}/${batch.length} — "${m.name}" NOT_FOUND ` +
               `(YouTube healthy, all queries exhausted, no trailer). ` +
               `DB marked trailerJobStatus='NOT_FOUND'. Remaining: ${remaining}`
             );
+            // ⭐ Yêu cầu #3: cập nhật checkpoint lastProcessed
+            await trailerCheckpoint.afterMovie(jobId, m, idxOverall, 'NOT_FOUND').catch(() => {});
           } else if (result.status === 'SKIPPED') {
             skipped++;
             logger.info(
-              `[Trailer] ⏭ [Batch ${batchNo}/${totalBatches}] ` +
+              `[Crawler] ⏭ [Batch ${batchNo}/${totalBatches}] ` +
               `${idxInBatch}/${batch.length} — "${m.name}" SKIPPED ` +
               `(${result.skipReason || 'dedupe/in-flight/cooldown'}). ` +
               `Remaining: ${remaining}`
             );
+            await trailerCheckpoint.afterMovie(jobId, m, idxOverall, 'SKIPPED').catch(() => {});
           } else {
             errors++;
             logger.warn(
-              `[Trailer] ❌ [Batch ${batchNo}/${totalBatches}] ` +
+              `[Crawler] ❌ [Batch ${batchNo}/${totalBatches}] ` +
               `${idxInBatch}/${batch.length} — "${m.name}" UNKNOWN status=${result.status}. ` +
               `Remaining: ${remaining}`
             );
@@ -859,18 +1046,17 @@ class TrailerService {
         } catch (err) {
           errors++;
           logger.warn(
-            `[Trailer] ❌ [Batch ${batchNo}/${totalBatches}] ` +
+            `[Crawler] ❌ [Batch ${batchNo}/${totalBatches}] ` +
             `${idxInBatch}/${batch.length} — "${m.name}" EXCEPTION: ${err.message}`
           );
         }
 
         // Inter-movie delay (within batch): random [min, max] ms.
-        // Only sleep if not the LAST movie of the batch AND batch wasn't aborted.
         if (i < batch.length - 1 && !batchAborted) {
           const span = Math.max(0, movieDelayMaxMs - movieDelayMinMs);
           const delayMs = movieDelayMinMs + Math.floor(Math.random() * (span + 1));
           logger.debug(
-            `[Trailer] ⏱ Inter-movie delay: ${Math.round(delayMs / 1000)}s ` +
+            `[Crawler] ⏱ Inter-movie delay: ${Math.round(delayMs / 1000)}s ` +
             `(random in [${movieDelayMinMs}, ${movieDelayMaxMs}]ms)`
           );
           await _sleep(delayMs);
@@ -878,26 +1064,56 @@ class TrailerService {
       }
 
       // After batch: either aborted (already cooled down) or finished cleanly.
-      if (batchAborted) {
+      if (batchAborted && !quotaExceededAbort) {
         logger.warn(
-          `[Trailer] 🛑 Batch ${batchNo}/${totalBatches} ABORTED due to RATE_LIMITED. ` +
+          `[Crawler] 🛑 Batch ${batchNo}/${totalBatches} ABORTED due to RATE_LIMITED. ` +
           `Resuming next batch after cooldown.`
         );
-      } else {
+      } else if (!quotaExceededAbort) {
         logger.info(
-          `[Trailer] 🏁 Batch ${batchNo}/${totalBatches} COMPLETE ` +
+          `[Crawler] 🏁 Batch ${batchNo}/${totalBatches} COMPLETE ` +
           `(found=${found}, rateLimited=${rateLimited}, notFound=${notFound}, ` +
           `errors=${errors}, skipped=${skipped}).`
         );
         // Inter-batch pause (skip if this is the last batch).
         if (b < totalBatches - 1) {
           logger.info(
-            `[Trailer] 💤 Inter-batch pause: ${Math.round(batchPauseMs / 1000)}s ` +
+            `[Crawler] 💤 Inter-batch pause: ${Math.round(batchPauseMs / 1000)}s ` +
             `before batch ${batchNo + 1}/${totalBatches}...`
           );
           await _sleep(batchPauseMs);
         }
       }
+    }
+
+    // -------------------------------------------------------------------------
+    // FINALIZE CHECKPOINT
+    // -------------------------------------------------------------------------
+    let finalStatus = 'COMPLETED';
+    if (quotaExceededAbort) {
+      finalStatus = 'QUOTA_EXCEEDED';
+    }
+
+    try {
+      if (finalStatus === 'COMPLETED') {
+        // ⭐ Yêu cầu #8: hoàn thành → set currentIndex = totalMovies
+        await trailerCheckpoint.complete(jobId, pool.length, {
+          found, notFound, rateLimited, errors, skipped,
+        });
+        logger.info(
+          `[Crawler] ✅ COMPLETED jobId=${jobId} ${pool.length}/${pool.length} movies. ` +
+          `Stats: found=${found}, notFound=${notFound}, rateLimited=${rateLimited}, ` +
+          `errors=${errors}, skipped=${skipped}`
+        );
+      } else {
+        // QUOTA_EXCEEDED — checkpoint đã được lưu trong block trên
+        logger.info(
+          `[Crawler] ⛔ STOPPED at status=QUOTA_EXCEEDED jobId=${jobId}. ` +
+          `Resume from saved checkpoint when quota reset.`
+        );
+      }
+    } catch (cpErr) {
+      logger.error(`[Crawler] Failed to finalize checkpoint: ${cpErr.message}`);
     }
 
     const stats = {
@@ -911,8 +1127,15 @@ class TrailerService {
       cooldowns,
       batches: totalBatches,
       batchesPlanned: totalBatches,
+      quotaExceeded: quotaExceededAbort,
+      quotaResetAt: quotaResetAt,
+      // ⭐ Yêu cầu #1: trả về checkpoint info
+      jobId,
+      status: finalStatus,
+      currentIndex: quotaExceededAbort ? resumeFromIndex : pool.length,
+      totalMovies: pool.length,
     };
-    logger.info(`[Trailer] ✅ Batch update complete: ${JSON.stringify(stats)}`);
+    logger.info(`[Crawler] ✅ Batch update complete: ${JSON.stringify(stats)}`);
     return stats;
   }
 

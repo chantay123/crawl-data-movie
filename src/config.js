@@ -81,13 +81,17 @@ module.exports = {
   // Khi gặp 429/RATE_LIMITED → dừng batch hiện tại, sleep `rateLimitCooldownMs`,
   // rồi tiếp tục các phim chưa xử lý.
   trailerBatch: {
+    // ⭐ HARD CAP: tối đa 3 query / mỗi movie (yêu cầu #1, #11)
+    // Override bằng env `TRAILER_MAX_SEARCH_PER_MOVIE` (chỉ nhận 2-3).
+    maxSearchPerMovie: Math.min(3, Math.max(2, toInt(process.env.TRAILER_MAX_SEARCH_PER_MOVIE, 3))),
     // Chỉ chấp nhận {10, 20, 30, 40}. Anything else falls back to 10.
     batchSize: toInt(process.env.TRAILER_BATCH_SIZE, 10),
     // Sleep 60 giây giữa các batch (ms)
     batchPauseMs: toInt(process.env.TRAILER_BATCH_PAUSE_MS, 60_000),
     // Delay ngẫu nhiên giữa mỗi phim trong cùng batch (ms)
-    movieDelayMinMs: toInt(process.env.TRAILER_MOVIE_DELAY_MIN_MS, 3_000),
-    movieDelayMaxMs: toInt(process.env.TRAILER_MOVIE_DELAY_MAX_MS, 8_000),
+    // Yêu cầu #11: 5-10 giây giữa các phim (giảm QUOTA_EXCEEDED).
+    movieDelayMinMs: toInt(process.env.TRAILER_MOVIE_DELAY_MIN_MS, 5_000),
+    movieDelayMaxMs: toInt(process.env.TRAILER_MOVIE_DELAY_MAX_MS, 10_000),
     // Cooldown khi gặp 429/RATE_LIMITED (ms) - mặc định 30 phút
     rateLimitCooldownMs: toInt(process.env.TRAILER_RATE_LIMIT_COOLDOWN_MS, 30 * 60_000),
     // Số phim tối đa xử lý trong 1 lần chạy batch (0 = không giới hạn, dùng batchSize làm cap)
